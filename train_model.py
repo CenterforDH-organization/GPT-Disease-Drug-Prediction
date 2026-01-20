@@ -505,9 +505,16 @@ while True:
             val_loss_unpooled = 0.1 * losses['val'] + 0.9 * val_loss_unpooled
             val_loss = val_loss_unpooled[0].item()  # Total loss
             
-            print(f"step {iter_num}: train loss {losses['train'][0].item():.4f}, val loss {losses['val'][0].item():.4f} ({val_loss:.4f})")
-            print(f"  breakdown - data: {val_loss_unpooled[1].item():.4f}, shift: {val_loss_unpooled[2].item():.4f}, "
-                  f"total: {val_loss_unpooled[3].item():.4f}, time: {val_loss_unpooled[4].item():.4f}")
+            train_breakdown = losses['train']
+            val_breakdown = losses['val']
+            print(f"step {iter_num}: train loss {train_breakdown[0].item():.4f}, val loss {val_breakdown[0].item():.4f} (ema {val_loss:.4f})")
+            print(
+                "  breakdown (train/val) - "
+                f"data: {train_breakdown[1].item():.4f}/{val_breakdown[1].item():.4f}, "
+                f"shift: {train_breakdown[2].item():.4f}/{val_breakdown[2].item():.4f}, "
+                f"total: {train_breakdown[3].item():.4f}/{val_breakdown[3].item():.4f}, "
+                f"time: {train_breakdown[4].item():.4f}/{val_breakdown[4].item():.4f}"
+            )
             
             if wandb_log:
                 wandb.log({
