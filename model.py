@@ -914,7 +914,7 @@ class CompositeDelphiConfig:
     
     # Loss weights
     loss_weight_data: float = 1.0
-    loss_weight_shift: float = 0.5
+    loss_weight_shift: float = 1.0
     loss_weight_total: float = 0.5
     loss_weight_time: float = 1.0
 
@@ -922,7 +922,7 @@ class CompositeDelphiConfig:
     # - shift_loss_type: 'ce' (weighted cross-entropy) or 'focal'
     # - shift_ignore_index: typically 0 (padding/unknown)
     # - shift_class_weights: per-class weights (length == shift_vocab_size). If empty, unweighted.
-    shift_loss_type: str = 'ce'
+    shift_loss_type: str = 'focal'
     shift_ignore_index: int = 0
     shift_focal_gamma: float = 2.0
     shift_class_weights: list = field(default_factory=list)
@@ -985,8 +985,8 @@ class CompositeDelphi(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
     def forward(self, data, shift, total, age,
-                targets_data=None, targets_shift=None, targets_total=None, 
-                targets_age=None,
+                targets_data=None, targets_shift=None, targets_total=None,
+                targets_age=None, drug_conditioning_data=None,
                 validation_loss_mode=False):
         """
         Args:
@@ -1033,11 +1033,16 @@ class CompositeDelphi(nn.Module):
         # 6. Multi-Head Output
         # Drug-Conditioning: 학습 시 targets_data의 embedding을 조건으로 사용 (teacher forcing)
         drug_emb = None
-        if self.config.use_drug_conditioning and targets_data is not None:
-            # targets_data의 embedding을 drug 조건으로 사용
-            # clamp to valid range (same as in CompositeEmbedding)
-            targets_data_clamped = torch.clamp(targets_data, min=0, max=self.composite_emb.data_emb.num_embeddings - 1)
-            drug_emb = self.composite_emb.data_emb(targets_data_clamped)
+        if self.config.use_drug_conditioning:
+            drug_source = targets_data if targets_data is not None else drug_conditioning_data
+            if drug_source is not None:
+                # clamp to valid range (same as in CompositeEmbedding)
+                drug_source_clamped = torch.clamp(
+                    drug_source,
+                    min=0,
+                    max=self.composite_emb.data_emb.num_embeddings - 1,
+                )
+                drug_emb = self.composite_emb.data_emb(drug_source_clamped)
         
         logits = self.multi_head(x, drug_emb=drug_emb)
         
@@ -1086,8 +1091,15 @@ class CompositeDelphi(nn.Module):
         )
         
         # 2. SHIFT Classification Loss (Weighted CE or Focal) + ignore padding(0)
-        shift_logits_flat = logits['shift'].reshape(-1, logits['shift'].size(-1))[pass_tokens]
-        shift_targets_flat = targets_shift.reshape(-1)[pass_tokens]
+        shift_logits_source = logits['shift']
+        if 'shift_drug_cond' in logits and self.config.use_drug_conditioning:
+            shift_logits_source = logits['shift_drug_cond']
+
+        shift_targets_all = targets_shift.reshape(-1)
+        shift_pass_tokens = shift_targets_all != -1
+
+        shift_logits_flat = shift_logits_source.reshape(-1, shift_logits_source.size(-1))[shift_pass_tokens]
+        shift_targets_flat = shift_targets_all[shift_pass_tokens]
         
         # Clamp targets to valid vocab range (defensive measure)
         shift_vocab_size = self.config.shift_vocab_size
@@ -1174,16 +1186,16 @@ class CompositeDelphi(nn.Module):
             # PDF: f(t) = (k/λ) * (t/λ)^(k-1) * exp(-(t/λ)^k)
             # log f(t) = log(k) - k*log(λ) + (k-1)*log(t) - (t/λ)^k
             
-            # Use DATA logits for scale parameter (consistent with exponential)
-            data_logits = logits['data']  # (B, T, data_vocab_size)
+            # Use time head logits for scale parameter (consistent with exponential)
+            time_logits = logits['time_scale']  # (B, T, data_vocab_size)
             time_shape = logits['time_shape']  # (B, T, vocab_size) - k (positive)
             
             # λ = exp(logsumexp) ensures positivity
-            log_scale = torch.logsumexp(data_logits, -1)  # (B, T)
+            log_scale = torch.logsumexp(time_logits, -1)  # (B, T)
             scale = torch.clamp(torch.exp(log_scale), min=1.0, max=365.0)  # 1일~1년 범위로 제한
             
             # k = weighted mean shape (clamp for stability)
-            event_probs = F.softmax(data_logits, dim=-1)  # (B, T, vocab_size)
+            event_probs = F.softmax(time_logits, dim=-1)  # (B, T, vocab_size)
             shape = torch.clamp((event_probs * time_shape).sum(-1), min=0.5, max=5.0)  # 더 좁은 범위
             
             # Weibull negative log-likelihood with numerical stability
@@ -1222,10 +1234,9 @@ class CompositeDelphi(nn.Module):
             # PDF: f(t) = λ * exp(-λt)
             # log f(t) = log(λ) - λt
             
-            # Use DATA logits for time calculation (original Delphi approach)
-            # This makes sense because time-to-event is directly related to disease prediction
-            data_logits = logits['data']  # (B, T, data_vocab_size)
-            lse = torch.logsumexp(data_logits, -1)  # (B, T)
+            # Use time head logits for time calculation (original Delphi approach)
+            time_logits = logits['time_scale']  # (B, T, data_vocab_size)
+            lse = torch.logsumexp(time_logits, -1)  # (B, T)
             lse = -torch.log(torch.exp(-lse) + self.config.t_min)
             
             ldt = -torch.log(dt + self.config.t_min).view(-1)
@@ -1343,12 +1354,19 @@ class CompositeDelphi(nn.Module):
             max_new_tokens = 128
         
         for _ in range(max_new_tokens):
-            logits, _, _ = self(data, shift, total, age)
+            logits, _, _ = self(data, shift, total, age, drug_conditioning_data=data)
             
             # Get last position logits
             data_logits = logits['data'][:, -1, :]
-            shift_logits = logits['shift'][:, -1, :]
-            total_logits = logits['total'][:, -1, :]
+            shift_logits_source = logits['shift']
+            if 'shift_drug_cond' in logits and self.config.use_drug_conditioning:
+                shift_logits_source = logits['shift_drug_cond']
+            shift_logits = shift_logits_source[:, -1, :]
+
+            total_pred_source = logits['total']
+            if 'total_drug_cond' in logits and self.config.use_drug_conditioning:
+                total_pred_source = logits['total_drug_cond']
+            total_pred = total_pred_source[:, -1]
             time_logits = logits['time'][:, -1, :]
             
             # Mask ignored tokens
@@ -1371,7 +1389,15 @@ class CompositeDelphi(nn.Module):
             
             # Sample shift, total from their distributions
             shift_next = torch.argmax(shift_logits, dim=-1, keepdim=True)
-            total_next = torch.argmax(total_logits, dim=-1, keepdim=True)
+            total_next = (
+                torch.clamp(
+                    total_pred.round(),
+                    min=0,
+                    max=self.config.total_vocab_size - 1,
+                )
+                .long()
+                .unsqueeze(-1)
+            )
             
             # Append to sequences
             data = torch.cat((data, data_next), dim=1)
