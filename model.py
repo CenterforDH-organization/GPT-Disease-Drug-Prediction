@@ -1186,16 +1186,16 @@ class CompositeDelphi(nn.Module):
             # PDF: f(t) = (k/λ) * (t/λ)^(k-1) * exp(-(t/λ)^k)
             # log f(t) = log(k) - k*log(λ) + (k-1)*log(t) - (t/λ)^k
             
-            # Use DATA logits for scale parameter (consistent with exponential)
-            data_logits = logits['data']  # (B, T, data_vocab_size)
+            # Use time head logits for scale parameter (consistent with exponential)
+            time_logits = logits['time_scale']  # (B, T, data_vocab_size)
             time_shape = logits['time_shape']  # (B, T, vocab_size) - k (positive)
             
             # λ = exp(logsumexp) ensures positivity
-            log_scale = torch.logsumexp(data_logits, -1)  # (B, T)
+            log_scale = torch.logsumexp(time_logits, -1)  # (B, T)
             scale = torch.clamp(torch.exp(log_scale), min=1.0, max=365.0)  # 1일~1년 범위로 제한
             
             # k = weighted mean shape (clamp for stability)
-            event_probs = F.softmax(data_logits, dim=-1)  # (B, T, vocab_size)
+            event_probs = F.softmax(time_logits, dim=-1)  # (B, T, vocab_size)
             shape = torch.clamp((event_probs * time_shape).sum(-1), min=0.5, max=5.0)  # 더 좁은 범위
             
             # Weibull negative log-likelihood with numerical stability
@@ -1234,10 +1234,9 @@ class CompositeDelphi(nn.Module):
             # PDF: f(t) = λ * exp(-λt)
             # log f(t) = log(λ) - λt
             
-            # Use DATA logits for time calculation (original Delphi approach)
-            # This makes sense because time-to-event is directly related to disease prediction
-            data_logits = logits['data']  # (B, T, data_vocab_size)
-            lse = torch.logsumexp(data_logits, -1)  # (B, T)
+            # Use time head logits for time calculation (original Delphi approach)
+            time_logits = logits['time_scale']  # (B, T, data_vocab_size)
+            lse = torch.logsumexp(time_logits, -1)  # (B, T)
             lse = -torch.log(torch.exp(-lse) + self.config.t_min)
             
             ldt = -torch.log(dt + self.config.t_min).view(-1)
