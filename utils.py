@@ -159,11 +159,11 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
                         block_size=48, device='cpu', lifestyle_augmentations=False, 
                         no_event_token_rate=5, cut_batch=False):
     """
-    Get a batch of composite data (DATA, DOSE, TOTAL, UNIT) from the dataset.
+    Get a batch of composite data (DATA, SHIFT, TOTAL) from the dataset.
     
     Args:
         ix: list of indices to get data from
-        data: structured numpy array with fields (ID, AGE, DATA, DOSE, TOTAL, UNIT)
+        data: structured numpy array with fields (ID, AGE, DATA, SHIFT, TOTAL)
         p2i: numpy array of the patient to index mapping
         select: 'left', 'right', 'random'
         index: 'patient', 'random'
@@ -176,14 +176,12 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
 
     Returns:
         x_data: input DATA tokens (B, T)
-        x_dose: input DOSE values (B, T)  
+        x_shift: input SHIFT values (B, T)  
         x_total: input TOTAL values (B, T)
-        x_unit: input UNIT values (B, T)
         ages: input ages (B, T)
         y_data: target DATA tokens (B, T)
-        y_dose: target DOSE values (B, T)
+        y_shift: target SHIFT values (B, T)
         y_total: target TOTAL values (B, T)
-        y_unit: target UNIT values (B, T)
         y_ages: target ages (B, T)
     """
     mask_time = -10000.
@@ -218,16 +216,14 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
 
     # Extract all fields
     data_tokens = torch.from_numpy(data['DATA'][batch_idx].astype(np.int64))
-    dose_values = torch.from_numpy(data['DOSE'][batch_idx].astype(np.float32))
+    shift_values = torch.from_numpy(data['SHIFT'][batch_idx].astype(np.int64))
     total_values = torch.from_numpy(data['TOTAL'][batch_idx].astype(np.int64))
-    unit_values = torch.from_numpy(data['UNIT'][batch_idx].astype(np.int64))
     ages = torch.from_numpy(data['AGE'][batch_idx].astype(np.float32))
 
     # Mask invalid data
     data_tokens = data_tokens.masked_fill(~mask, -1)
-    dose_values = dose_values.masked_fill(~mask, 0.0)
+    shift_values = shift_values.masked_fill(~mask, -1)
     total_values = total_values.masked_fill(~mask, -1)
-    unit_values = unit_values.masked_fill(~mask, -1)
     ages = ages.masked_fill(~mask, mask_time)
 
     # Insert "no event" tokens
@@ -248,60 +244,53 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
 
     # Stack "no event" tokens with real tokens
     data_tokens = torch.hstack([data_tokens, torch.zeros(len(ix), n_pad, dtype=torch.long)])  # 0 = no event
-    dose_values = torch.hstack([dose_values, torch.zeros(len(ix), n_pad, dtype=torch.float32)])
+    shift_values = torch.hstack([shift_values, torch.zeros(len(ix), n_pad, dtype=torch.long)])
     total_values = torch.hstack([total_values, torch.zeros(len(ix), n_pad, dtype=torch.long)])
-    unit_values = torch.hstack([unit_values, torch.zeros(len(ix), n_pad, dtype=torch.long)])
     ages = torch.hstack([ages, pad])
 
     # Mask out tokens that are too far in the future
     data_tokens = data_tokens.masked_fill(ages > m, -1)
-    dose_values = dose_values.masked_fill(ages > m, 0.0)
+    shift_values = shift_values.masked_fill(ages > m, -1)
     total_values = total_values.masked_fill(ages > m, -1)
-    unit_values = unit_values.masked_fill(ages > m, -1)
     ages = ages.masked_fill(ages > m, mask_time)
 
     # Sort by age
     s = torch.argsort(ages, 1)
     data_tokens = torch.gather(data_tokens, 1, s)
-    dose_values = torch.gather(dose_values, 1, s)
+    shift_values = torch.gather(shift_values, 1, s)
     total_values = torch.gather(total_values, 1, s)
-    unit_values = torch.gather(unit_values, 1, s)
     ages = torch.gather(ages, 1, s)
 
     # Shift tokens by 1 (0 is reserved for padding)
     data_tokens = data_tokens + 1
+    shift_values = shift_values + 1
     total_values = total_values + 1
-    unit_values = unit_values + 1
 
     # Cut padded tokens if possible
     if cut_batch:
         cut_margin = torch.min(torch.sum(data_tokens == 0, 1))
         data_tokens = data_tokens[:, cut_margin:]
-        dose_values = dose_values[:, cut_margin:]
+        shift_values = shift_values[:, cut_margin:]
         total_values = total_values[:, cut_margin:]
-        unit_values = unit_values[:, cut_margin:]
         ages = ages[:, cut_margin:]
 
     # Cut to maintain block size
     if data_tokens.shape[1] > block_size + 1:
         cut_margin = data_tokens.shape[1] - block_size - 1
         data_tokens = data_tokens[:, cut_margin:]
-        dose_values = dose_values[:, cut_margin:]
+        shift_values = shift_values[:, cut_margin:]
         total_values = total_values[:, cut_margin:]
-        unit_values = unit_values[:, cut_margin:]
         ages = ages[:, cut_margin:]
 
     # Split into input (x) and target (y)
     x_data = data_tokens[:, :-1]
-    x_dose = dose_values[:, :-1]
+    x_shift = shift_values[:, :-1]
     x_total = total_values[:, :-1]
-    x_unit = unit_values[:, :-1]
     x_ages = ages[:, :-1]
     
     y_data = data_tokens[:, 1:]
-    y_dose = dose_values[:, 1:]
+    y_shift = shift_values[:, 1:]
     y_total = total_values[:, 1:]
-    y_unit = unit_values[:, 1:]
     y_ages = ages[:, 1:]
 
     # Mask "no event" tokens
@@ -310,28 +299,26 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
     y_ages = y_ages.masked_fill(x_data == 0, mask_time)
 
     if device == 'cuda':
-        x_data, x_dose, x_total, x_unit, x_ages = [
+        x_data, x_shift, x_total, x_ages = [
             i.pin_memory().to(device, non_blocking=True) 
-            for i in [x_data, x_dose, x_total, x_unit, x_ages]
+            for i in [x_data, x_shift, x_total, x_ages]
         ]
-        y_data, y_dose, y_total, y_unit, y_ages = [
+        y_data, y_shift, y_total, y_ages = [
             i.pin_memory().to(device, non_blocking=True) 
-            for i in [y_data, y_dose, y_total, y_unit, y_ages]
+            for i in [y_data, y_shift, y_total, y_ages]
         ]
     else:
         x_data = x_data.to(device)
-        x_dose = x_dose.to(device)
+        x_shift = x_shift.to(device)
         x_total = x_total.to(device)
-        x_unit = x_unit.to(device)
         x_ages = x_ages.to(device)
         y_data = y_data.to(device)
-        y_dose = y_dose.to(device)
+        y_shift = y_shift.to(device)
         y_total = y_total.to(device)
-        y_unit = y_unit.to(device)
         y_ages = y_ages.to(device)
 
-    return (x_data, x_dose, x_total, x_unit, x_ages,
-            y_data, y_dose, y_total, y_unit, y_ages)
+    return (x_data, x_shift, x_total, x_ages,
+            y_data, y_shift, y_total, y_ages)
 
 
 def get_p2i_composite(data):

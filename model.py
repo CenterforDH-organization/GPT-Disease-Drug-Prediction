@@ -10,12 +10,64 @@ GPT-OSS
 import math
 import inspect
 from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
 import warnings
+
+# Always print (single GPU mode)
+def _is_master():
+    return True
+
+def focal_loss_multiclass(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    gamma: float = 2.0,
+    alpha: Optional[torch.Tensor] = None,
+    ignore_index: Optional[int] = None,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Multi-class focal loss.
+
+    Args:
+        logits: (N, C)
+        targets: (N,) int64
+        gamma: focusing parameter
+        alpha: optional per-class weights (C,)
+        ignore_index: optional class id to ignore
+        reduction: 'mean' | 'sum' | 'none'
+    """
+    if logits.numel() == 0:
+        return torch.tensor(0.0, device=logits.device)
+
+    if ignore_index is not None:
+        valid = targets != ignore_index
+        logits = logits[valid]
+        targets = targets[valid]
+        if logits.numel() == 0:
+            return torch.tensor(0.0, device=logits.device)
+
+    log_probs = F.log_softmax(logits, dim=-1)  # (N, C)
+    log_pt = log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)  # (N,)
+    pt = log_pt.exp()
+
+    focal = (1.0 - pt).clamp(min=0.0, max=1.0).pow(gamma)
+    loss = -focal * log_pt
+
+    if alpha is not None:
+        alpha_t = alpha.gather(dim=0, index=targets)
+        loss = alpha_t * loss
+
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    return loss
 
 
 class RMSNorm(nn.Module):
@@ -259,19 +311,28 @@ class MixtureOfExperts(nn.Module):
         # Compute expert outputs
         final_output = torch.zeros_like(x)
         
+        # Process each expert
         for i in range(self.num_experts):
-            expert_mask = (selected_experts == i)  # (B, T, experts_per_token)
-            expert_mask = expert_mask.any(dim=-1)  # (B, T)
+            # Find all tokens that selected this expert at any position
+            expert_mask = (selected_experts == i).any(dim=-1)  # (B, T)
             
-            if expert_mask.any():
-                expert_input = x[expert_mask]
-                expert_output = self.experts[i](expert_input)
-                
-                # Weight by routing probability
-                for k in range(self.experts_per_token):
-                    token_mask = (selected_experts[..., k] == i)
-                    weights = routing_weights[..., k:k+1][token_mask]
-                    final_output[token_mask] += weights * expert_output
+            if not expert_mask.any():
+                continue
+            
+            # Process all tokens that use this expert
+            expert_input = x[expert_mask]  # (N, C) where N = expert_mask.sum()
+            expert_output = self.experts[i](expert_input)  # (N, C)
+            
+            # Create a mapping to put expert_output back in the right places
+            expert_output_full = torch.zeros_like(x)  # (B, T, C)
+            expert_output_full[expert_mask] = expert_output
+            
+            # For each expert position k, add weighted contribution
+            for k in range(self.experts_per_token):
+                token_mask = (selected_experts[..., k] == i)  # (B, T)
+                if token_mask.any():
+                    weights = routing_weights[..., k:k+1]  # (B, T, 1)
+                    final_output += weights * expert_output_full * token_mask.unsqueeze(-1)
         
         return final_output
 
@@ -319,12 +380,11 @@ class ModernBlock(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x, att
 
-
 @dataclass
 class ModernDelphiConfig:
     """Configuration for Modern Delphi"""
     block_size: int = 1024
-    vocab_size: int = 1270 ############ NEED TO MODIFY
+    vocab_size: int = 1290  # Death token: raw 1288 → shifted 1289
     n_layer: int = 12
     n_head: int = 12
     n_kv_head: int = 4  # Grouped Query Attention (3x fewer KV heads)
@@ -344,7 +404,9 @@ class ModernDelphiConfig:
     experts_per_token: int = 2
     sliding_window: int = 256  # Sliding window attention
     rope_theta: float = 10000.0
-
+    
+    # Time-to-Event distribution: 'exponential' or 'weibull'
+    time_distribution: str = 'exponential'
 
 class ModernDelphi(nn.Module):
     """Modern Delphi with GPT-OSS inspired architecture"""
@@ -364,6 +426,11 @@ class ModernDelphi(nn.Module):
             ln_f = RMSNorm(config.n_embd),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        # Weibull shape head (for time-to-event)
+        time_distribution = getattr(config, 'time_distribution', 'exponential')
+        if time_distribution == 'weibull':
+            self.time_shape_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         
         # Weight tying
         self.transformer.wte.weight = self.lm_head.weight
@@ -441,8 +508,6 @@ class ModernDelphi(nn.Module):
             )
             
             # Time-to-event loss
-            lse = torch.logsumexp(logits, -1)
-            lse = -torch.log(torch.exp(-lse) + self.config.t_min)
             dt = torch.clamp(targets_age - age, min=1.0)
             
             if self.config.mask_ties:
@@ -452,9 +517,45 @@ class ModernDelphi(nn.Module):
                     .max(-1).indices.squeeze((1, 2))
                 )
             
-            ldt = -torch.log(dt + self.config.t_min).view(-1)
-            loss_dt = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - ldt.reshape(-1)))
-            loss_dt = torch.mean(loss_dt[pass_tokens])
+            time_distribution = getattr(self.config, 'time_distribution', 'exponential')
+            
+            if time_distribution == 'weibull':
+                # Weibull Distribution Loss (수치 안정성 강화)
+                # Shape parameter (k > 0)
+                time_shape = F.softplus(self.time_shape_head(x)) + 0.1  # (B, T, vocab_size)
+                
+                # λ = exp(logsumexp) ensures positivity
+                log_scale = torch.logsumexp(logits, -1)  # (B, T)
+                scale = torch.clamp(torch.exp(log_scale), min=0.1, max=1e4) + self.config.t_min
+                
+                # k = weighted mean shape (clamp for stability)
+                event_probs = F.softmax(logits, dim=-1)  # (B, T, vocab_size)
+                shape = torch.clamp((event_probs * time_shape).sum(-1), min=0.1, max=10.0)  # (B, T)
+                
+                # Weibull negative log-likelihood with numerical stability
+                dt_flat = torch.clamp(dt.view(-1), min=0.1) + self.config.t_min
+                scale_flat = scale.view(-1)
+                shape_flat = shape.view(-1)
+                
+                # Clamp ratio to prevent overflow
+                ratio = torch.clamp(dt_flat / scale_flat, min=1e-6, max=1e3)
+                
+                log_likelihood = (
+                    torch.log(shape_flat + 1e-8) - 
+                    shape_flat * torch.log(scale_flat + 1e-8) + 
+                    (shape_flat - 1) * torch.log(dt_flat + 1e-8) - 
+                    ratio.pow(shape_flat)
+                )
+                # Clamp final loss to prevent NaN
+                loss_dt = -torch.mean(torch.clamp(log_likelihood[pass_tokens], min=-100, max=100))
+            else:
+                # Exponential Distribution Loss (기존)
+                lse = torch.logsumexp(logits, -1)
+                lse = -torch.log(torch.exp(-lse) + self.config.t_min)
+                
+                ldt = -torch.log(dt + self.config.t_min).view(-1)
+                loss_dt = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - ldt.reshape(-1)))
+                loss_dt = torch.mean(loss_dt[pass_tokens])
             
             loss = {'loss_ce': loss_ce, 'loss_dt': loss_dt}
         else:
@@ -495,12 +596,19 @@ class ModernDelphi(nn.Module):
 
         param_dict = {pn: p for pn, p in self.named_parameters()}
         
+        # Remove lm_head.weight from no_decay if it doesn't exist in param_dict (due to weight tying)
+        # The actual parameter is wte.weight, which is already handled as an Embedding
+        if 'lm_head.weight' in no_decay and 'lm_head.weight' not in param_dict:
+            no_decay.discard('lm_head.weight')
+        
         # Check for overlapping parameters and resolve
         inter_params = decay & no_decay
         if inter_params:
-            print(f"Warning: Found {len(inter_params)} parameters in both decay and no_decay, moving to no_decay:")
-            for pn in sorted(inter_params):
-                print(f"  {pn}")
+            if _is_master():
+                print(f"Warning: Found {len(inter_params)} parameters in both decay and no_decay, moving to no_decay:")
+                for pn in sorted(inter_params):
+                    print(f"  {pn}")
+            for pn in list(inter_params):
                 decay.discard(pn)
         
         union_params = decay | no_decay
@@ -508,9 +616,11 @@ class ModernDelphi(nn.Module):
         # Find missing parameters
         missing_params = param_dict.keys() - union_params
         if missing_params:
-            print(f"Warning: Found {len(missing_params)} unclassified parameters, adding to no_decay:")
-            for pn in sorted(missing_params):
-                print(f"  {pn}")
+            if _is_master():
+                print(f"Warning: Found {len(missing_params)} unclassified parameters, adding to no_decay:")
+                for pn in sorted(missing_params):
+                    print(f"  {pn}")
+            for pn in missing_params:
                 no_decay.add(pn)
         
         # Final check
@@ -525,7 +635,8 @@ class ModernDelphi(nn.Module):
         ]
         
         use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
-        print(f"using fused AdamW: {use_fused}")
+        if _is_master():
+            print(f"using fused AdamW: {use_fused}")
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
 
@@ -593,9 +704,8 @@ class CompositeEmbedding(nn.Module):
     """
     Composite Embedding Layer: 여러 입력 필드를 각각 임베딩하고 합산
     - DATA (약품/질병 코드) -> ID Embedding
-    - DOSE (용량) -> Dose Embedding (이산화된 값)
+    - SHIFT (시프트 값) -> Shift Embedding
     - TOTAL (기간) -> Duration Embedding
-    - UNIT (단위) -> Unit Embedding
     """
     
     def __init__(self, config):
@@ -604,50 +714,32 @@ class CompositeEmbedding(nn.Module):
         
         # 각 필드별 Embedding
         self.data_emb = nn.Embedding(config.data_vocab_size, config.n_embd)
-        self.dose_emb = nn.Embedding(config.dose_vocab_size, config.n_embd)
+        self.shift_emb = nn.Embedding(config.shift_vocab_size, config.n_embd)
         self.total_emb = nn.Embedding(config.total_vocab_size, config.n_embd)
-        self.unit_emb = nn.Embedding(config.unit_vocab_size, config.n_embd)
         
-        # Dose는 연속값일 수 있으므로 이산화용 버킷 경계 정의
-        # 예: [0, 0.5, 1, 2, 5, 10, 20, 50, 100, ...]
-        self.register_buffer('dose_buckets', torch.tensor(
-            [0.0, 0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0]
-        ))
-        
-    def discretize_dose(self, dose):
-        """연속 dose 값을 이산 버킷 인덱스로 변환"""
-        # dose가 각 버킷보다 큰지 확인하여 버킷 인덱스 계산
-        bucket_idx = (dose.unsqueeze(-1) > self.dose_buckets).sum(-1)
-        return bucket_idx.long()
-        
-    def forward(self, data, dose, total, unit):
+    def forward(self, data, shift, total):
         """
         Args:
             data: (B, T) DATA tokens
-            dose: (B, T) DOSE values (연속 또는 이산)
+            shift: (B, T) SHIFT values (정수값)
             total: (B, T) TOTAL tokens
-            unit: (B, T) UNIT tokens
         Returns:
             combined embedding (B, T, n_embd)
         """
-        # DATA embedding
-        data_emb = self.data_emb(data)
+        # DATA embedding (clamp to valid range)
+        data_idx = torch.clamp(data, min=0, max=self.data_emb.num_embeddings - 1)
+        data_emb = self.data_emb(data_idx)
         
-        # DOSE embedding (이산화)
-        if dose.dtype == torch.float32 or dose.dtype == torch.float64:
-            dose_idx = self.discretize_dose(dose)
-        else:
-            dose_idx = dose
-        dose_emb = self.dose_emb(dose_idx)
+        # SHIFT embedding (clamp to valid range)
+        shift_idx = torch.clamp(shift, min=0, max=self.shift_emb.num_embeddings - 1)
+        shift_emb = self.shift_emb(shift_idx)
         
-        # TOTAL embedding
-        total_emb = self.total_emb(total)
-        
-        # UNIT embedding
-        unit_emb = self.unit_emb(unit)
+        # TOTAL embedding (clamp to valid range)
+        total_idx = torch.clamp(total, min=0, max=self.total_emb.num_embeddings - 1)
+        total_emb = self.total_emb(total_idx)
         
         # 모든 임베딩 합산
-        combined = data_emb + dose_emb + total_emb + unit_emb
+        combined = data_emb + shift_emb + total_emb
         
         return combined
 
@@ -655,40 +747,114 @@ class CompositeEmbedding(nn.Module):
 class MultiHeadOutput(nn.Module):
     """
     Multi-Head Output Layer: 각 필드별 예측 헤드
-    - ID Head: 다음 DATA 토큰 예측
-    - Dose Head: 다음 DOSE 값 예측
-    - Duration Head: 다음 TOTAL 값 예측
-    - Unit Head: 다음 UNIT 값 예측
+    - DATA Head: 다음 DATA 토큰 예측 (Classification)
+    - SHIFT Head: 다음 SHIFT 값 예측 (Classification)
+    - TOTAL Head: 다음 TOTAL 값 예측 (Regression, 연속값)
     - Time Head: 다음 이벤트까지의 시간 예측
+      - Exponential: scale (λ) parameter만 예측
+      - Weibull: scale (λ) + shape (k) parameter 예측
+    
+    Drug-Conditioned Heads (optional):
+    - 약물(drug) 정보를 조건으로 SHIFT/TOTAL 예측 성능 향상
+    - FiLM (Feature-wise Linear Modulation) 방식 사용
     """
     
     def __init__(self, config):
         super().__init__()
         self.n_embd = config.n_embd
+        self.time_distribution = getattr(config, 'time_distribution', 'exponential')
         
-        # 각 필드별 Linear Head
+        # Drug-conditioning option
+        self.use_drug_conditioning = getattr(config, 'use_drug_conditioning', False)
+        
+        # Classification Heads (DATA, SHIFT)
         self.data_head = nn.Linear(config.n_embd, config.data_vocab_size, bias=False)
-        self.dose_head = nn.Linear(config.n_embd, config.dose_vocab_size, bias=False)
-        self.total_head = nn.Linear(config.n_embd, config.total_vocab_size, bias=False)
-        self.unit_head = nn.Linear(config.n_embd, config.unit_vocab_size, bias=False)
+        self.shift_head = nn.Linear(config.n_embd, config.shift_vocab_size, bias=False)
         
-        # Time Head는 모든 vocab에 대한 rate parameter 출력
+        # Regression Head (TOTAL) - 출력 dim = 1
+        self.total_head = nn.Linear(config.n_embd, 1, bias=True)
+        
+        # ============================================================
+        # Drug-Conditioned Heads (FiLM style)
+        # 약물 정보로 hidden state를 변조하여 SHIFT/TOTAL 예측
+        # ============================================================
+        if self.use_drug_conditioning:
+            # FiLM generator: drug_emb → (gamma, beta) for modulation
+            # SHIFT: drug 조건
+            self.shift_film_generator = nn.Sequential(
+                nn.Linear(config.n_embd, config.n_embd),
+                nn.GELU(),
+                nn.Linear(config.n_embd, config.n_embd * 2)  # gamma, beta
+            )
+            self.shift_drug_cond_head = nn.Sequential(
+                nn.Linear(config.n_embd, config.n_embd // 2),
+                nn.GELU(),
+                nn.Linear(config.n_embd // 2, config.shift_vocab_size)
+            )
+            
+            # TOTAL: drug 조건만
+            self.total_film_generator = nn.Sequential(
+                nn.Linear(config.n_embd, config.n_embd),
+                nn.GELU(),
+                nn.Linear(config.n_embd, config.n_embd * 2)  # gamma, beta
+            )
+            self.total_drug_cond_head = nn.Sequential(
+                nn.Linear(config.n_embd, config.n_embd // 2),
+                nn.GELU(),
+                nn.Linear(config.n_embd // 2, 1)
+            )
+        
+        # Time Head: scale parameter (λ) for all event types
         self.time_head = nn.Linear(config.n_embd, config.data_vocab_size, bias=False)
         
-    def forward(self, x):
+        # Weibull shape parameter (k) - 전역 또는 per-event
+        if self.time_distribution == 'weibull':
+            # Shape parameter per event type (more expressive)
+            self.time_shape_head = nn.Linear(config.n_embd, config.data_vocab_size, bias=False)
+        
+    def forward(self, x, drug_emb=None):
         """
         Args:
             x: (B, T, n_embd) transformer output
+            drug_emb: (B, T, n_embd) drug token embedding for conditioning (optional)
+                      - 학습 시: targets_data의 embedding (teacher forcing)
+                      - 추론 시: 예측된 data의 embedding 또는 None
         Returns:
-            dict of logits for each head
+            dict of logits/values for each head
         """
-        return {
-            'data': self.data_head(x),      # (B, T, data_vocab_size)
-            'dose': self.dose_head(x),      # (B, T, dose_vocab_size)
-            'total': self.total_head(x),    # (B, T, total_vocab_size)
-            'unit': self.unit_head(x),      # (B, T, unit_vocab_size)
-            'time': self.time_head(x),      # (B, T, data_vocab_size)
+        output = {
+            'data': self.data_head(x),               # (B, T, data_vocab_size) - classification logits
+            'shift': self.shift_head(x),             # (B, T, shift_vocab_size) - classification logits
+            'total': self.total_head(x).squeeze(-1), # (B, T) - regression value
+            'time_scale': self.time_head(x),         # (B, T, data_vocab_size) - λ parameter
         }
+        
+        # ============================================================
+        # Drug-Conditioned Predictions (FiLM modulation)
+        # ============================================================
+        if self.use_drug_conditioning and drug_emb is not None:
+            # SHIFT: FiLM modulation with drug embedding
+            shift_film = self.shift_film_generator(drug_emb)  # (B, T, n_embd*2)
+            shift_gamma, shift_beta = shift_film.chunk(2, dim=-1)  # 각각 (B, T, n_embd)
+            shift_modulated = shift_gamma * x + shift_beta  # FiLM: γ * x + β
+            shift_drug_cond = self.shift_drug_cond_head(shift_modulated)  # (B, T, shift_vocab_size)
+            output['shift_drug_cond'] = shift_drug_cond
+            
+            # TOTAL: FiLM modulation with drug embedding
+            total_film = self.total_film_generator(drug_emb)  # (B, T, n_embd*2)
+            total_gamma, total_beta = total_film.chunk(2, dim=-1)  # 각각 (B, T, n_embd)
+            total_modulated = total_gamma * x + total_beta  # FiLM: γ * x + β
+            total_drug_cond = self.total_drug_cond_head(total_modulated).squeeze(-1)  # (B, T)
+            output['total_drug_cond'] = total_drug_cond
+        
+        # For backward compatibility
+        output['time'] = output['time_scale']
+        
+        if self.time_distribution == 'weibull':
+            # Weibull shape parameter (k > 0, use softplus to ensure positivity)
+            output['time_shape'] = F.softplus(self.time_shape_head(x)) + 0.1  # (B, T, data_vocab_size)
+        
+        return output
 
 
 @dataclass
@@ -697,10 +863,21 @@ class CompositeDelphiConfig:
     block_size: int = 1024
     
     # Vocabulary sizes for each field
-    data_vocab_size: int = 1500  # 약품/질병 코드 수
-    dose_vocab_size: int = 16    # 이산화된 dose 버킷 수
-    total_vocab_size: int = 128  # 기간 (일수) vocab
-    unit_vocab_size: int = 8     # 단위 vocab
+    # 
+    # Embedding vocab sizes (모든 필드의 embedding에 사용):
+    # - DATA: includes drugs (Metformin~Death, raw 1277-1288) → after +1 shift: 1278-1289 → vocab_size = 1290
+    # - SHIFT: range depends on dataset (need to check actual range)
+    # - TOTAL: range 0-550 → vocab_size = 551
+    #
+    # Head 구조:
+    # - DATA Head: Linear(n_embd, 1290) → Softmax + Cross-Entropy (Classification)
+    # - SHIFT Head: Linear(n_embd, shift_vocab_size) → Softmax + Cross-Entropy (Classification)
+    # - TOTAL Head: Linear(n_embd, 1) → Weighted Huber Loss (Regression)
+    # Note: vocab sizes include +1 for the shift in get_batch_composite (0 reserved for padding)
+    # Drug tokens: raw 1277~1288 → after +1 shift: 1278~1289 → max token 1289
+    data_vocab_size: int = 1290   # DATA embedding & head (Classification) - includes Death token
+    shift_vocab_size: int = 5     # SHIFT embedding & head (Classification) - values 0-3, after +1 shift: 1-4 → vocab_size=5
+    total_vocab_size: int = 552   # TOTAL embedding only (Regression head dim=1) - max 551 after +1 shift
     
     # Model architecture
     n_layer: int = 12
@@ -716,6 +893,18 @@ class CompositeDelphiConfig:
     mask_ties: bool = True
     ignore_tokens: list = field(default_factory=lambda: [0])
     
+    # Drug-Conditioning: 약물 정보를 조건으로 SHIFT/TOTAL 예측 성능 향상
+    # FiLM (Feature-wise Linear Modulation) 방식 사용
+    use_drug_conditioning: bool = False
+    
+    # Drug token range (after +1 shift in get_batch_composite):
+    # Raw tokens: Metformin(1278), Sulfonylurea(1279), DPP-4(1280), Insulin(1281), 
+    #             Meglitinide(1282), Thiazolidinedione(1283), Alpha-glucosidase(1284),
+    #             GLP-1(1285), SGLT-2(1286), Other(1287), Death(1288)
+    # Shifted tokens: 1279-1289 (inclusive)
+    drug_token_min: int = 1279  # First drug token after +1 shift (Metformin)
+    drug_token_max: int = 1289  # Last drug token after +1 shift (Death)
+
     # Modern architecture features
     use_moe: bool = True
     num_experts: int = 8
@@ -725,17 +914,30 @@ class CompositeDelphiConfig:
     
     # Loss weights
     loss_weight_data: float = 1.0
-    loss_weight_dose: float = 0.5
+    loss_weight_shift: float = 0.5
     loss_weight_total: float = 0.5
-    loss_weight_unit: float = 0.5
     loss_weight_time: float = 1.0
+
+    # SHIFT loss options (handles class imbalance if needed)
+    # - shift_loss_type: 'ce' (weighted cross-entropy) or 'focal'
+    # - shift_ignore_index: typically 0 (padding/unknown)
+    # - shift_class_weights: per-class weights (length == shift_vocab_size). If empty, unweighted.
+    shift_loss_type: str = 'ce'
+    shift_ignore_index: int = 0
+    shift_focal_gamma: float = 2.0
+    shift_class_weights: list = field(default_factory=list)
+    
+    # Time-to-Event distribution: 'exponential' or 'weibull'
+    # - exponential: 상수 hazard rate (memoryless)
+    # - weibull: 시간에 따라 변하는 hazard rate (shape parameter k로 조절)
+    time_distribution: str = 'exponential'
 
 
 class CompositeDelphi(nn.Module):
     """
     Composite Delphi: Composite Embedding + Multi-Head Output
     
-    입력: (DATA, DOSE, TOTAL, UNIT, AGE)
+    입력: (DATA, SHIFT, TOTAL, AGE)
     출력: 각 필드별 예측 + 시간 예측
     """
     
@@ -770,8 +972,6 @@ class CompositeDelphi(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight') or pn.endswith('o_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-        
-        print(f"CompositeDelphi parameters: {self.get_num_params()/1e6:.2f}M")
     
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -784,16 +984,15 @@ class CompositeDelphi(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, data, dose, total, unit, age,
-                targets_data=None, targets_dose=None, targets_total=None, 
-                targets_unit=None, targets_age=None,
+    def forward(self, data, shift, total, age,
+                targets_data=None, targets_shift=None, targets_total=None, 
+                targets_age=None,
                 validation_loss_mode=False):
         """
         Args:
             data: (B, T) DATA tokens
-            dose: (B, T) DOSE values
+            shift: (B, T) SHIFT values
             total: (B, T) TOTAL tokens
-            unit: (B, T) UNIT tokens
             age: (B, T) AGE values
             targets_*: 각 필드의 타겟 (optional)
         """
@@ -801,7 +1000,7 @@ class CompositeDelphi(nn.Module):
         b, t = data.size()
         
         # 1. Composite Embedding
-        composite_emb = self.composite_emb(data, dose, total, unit)
+        composite_emb = self.composite_emb(data, shift, total)
         
         # 2. Age Encoding
         age_emb = self.age_encoding(age)
@@ -832,13 +1031,21 @@ class CompositeDelphi(nn.Module):
         att = torch.stack(att_list) if att_list[0] is not None else None
         
         # 6. Multi-Head Output
-        logits = self.multi_head(x)
+        # Drug-Conditioning: 학습 시 targets_data의 embedding을 조건으로 사용 (teacher forcing)
+        drug_emb = None
+        if self.config.use_drug_conditioning and targets_data is not None:
+            # targets_data의 embedding을 drug 조건으로 사용
+            # clamp to valid range (same as in CompositeEmbedding)
+            targets_data_clamped = torch.clamp(targets_data, min=0, max=self.composite_emb.data_emb.num_embeddings - 1)
+            drug_emb = self.composite_emb.data_emb(targets_data_clamped)
+        
+        logits = self.multi_head(x, drug_emb=drug_emb)
         
         # 7. Compute losses if targets provided
         if targets_data is not None:
             loss = self._compute_loss(
                 logits, data, age,
-                targets_data, targets_dose, targets_total, targets_unit, targets_age,
+                targets_data, targets_shift, targets_total, targets_age,
                 attn_mask, validation_loss_mode
             )
         else:
@@ -847,7 +1054,7 @@ class CompositeDelphi(nn.Module):
         return logits, loss, att
     
     def _compute_loss(self, logits, data, age,
-                      targets_data, targets_dose, targets_total, targets_unit, targets_age,
+                      targets_data, targets_shift, targets_total, targets_age,
                       attn_mask, validation_loss_mode):
         """Compute multi-head losses"""
         device = data.device
@@ -863,6 +1070,10 @@ class CompositeDelphi(nn.Module):
         for k in ignored_tokens:
             pass_tokens = pass_tokens * (targets_flat != k)
         
+        # Clamp targets to valid vocab range (defensive measure)
+        data_vocab_size = self.config.data_vocab_size
+        targets_flat_clamped = torch.clamp(targets_flat, min=0, max=data_vocab_size - 1)
+        
         # 1. DATA Cross-Entropy Loss
         data_logits = logits['data']
         if validation_loss_mode:
@@ -870,40 +1081,81 @@ class CompositeDelphi(nn.Module):
         
         loss_data = F.cross_entropy(
             data_logits.reshape(-1, data_logits.size(-1))[pass_tokens],
-            targets_flat[pass_tokens],
+            targets_flat_clamped[pass_tokens],  # ← clamp된 값 사용
             ignore_index=-1
         )
         
-        # 2. DOSE Cross-Entropy Loss
-        if targets_dose.dtype == torch.float32 or targets_dose.dtype == torch.float64:
-            targets_dose_idx = self.composite_emb.discretize_dose(targets_dose)
+        # 2. SHIFT Classification Loss (Weighted CE or Focal) + ignore padding(0)
+        shift_logits_flat = logits['shift'].reshape(-1, logits['shift'].size(-1))[pass_tokens]
+        shift_targets_flat = targets_shift.reshape(-1)[pass_tokens]
+        
+        # Clamp targets to valid vocab range (defensive measure)
+        shift_vocab_size = self.config.shift_vocab_size
+        shift_targets_flat = torch.clamp(shift_targets_flat, min=-1, max=shift_vocab_size - 1)
+        
+        shift_ignore = int(getattr(self.config, 'shift_ignore_index', 0))
+        # also ignore explicit -1 if present
+        shift_valid = (shift_targets_flat != -1) & (shift_targets_flat != shift_ignore)
+        shift_logits_flat = shift_logits_flat[shift_valid]
+        shift_targets_flat = shift_targets_flat[shift_valid]
+
+        if shift_logits_flat.numel() == 0:
+            loss_shift = torch.tensor(0.0, device=device)
         else:
-            targets_dose_idx = targets_dose
+            shift_loss_type = str(getattr(self.config, 'shift_loss_type', 'ce')).lower()
+            weights_list = getattr(self.config, 'shift_class_weights', None)
+            weight_t = None
+            if isinstance(weights_list, (list, tuple)) and len(weights_list) == self.config.shift_vocab_size:
+                weight_t = torch.tensor(weights_list, device=device, dtype=torch.float32)
+
+            if shift_loss_type == 'focal':
+                gamma = float(getattr(self.config, 'shift_focal_gamma', 2.0))
+                loss_shift = focal_loss_multiclass(
+                    shift_logits_flat,
+                    shift_targets_flat.long(),
+                    gamma=gamma,
+                    alpha=weight_t,
+                    ignore_index=None,  # already filtered
+                    reduction='mean',
+                )
+            else:
+                # weighted cross-entropy (if weight_t is provided)
+                loss_shift = F.cross_entropy(
+                    shift_logits_flat,
+                    shift_targets_flat.long(),
+                    weight=weight_t,
+                    ignore_index=-1,
+                )
         
-        loss_dose = F.cross_entropy(
-            logits['dose'].reshape(-1, logits['dose'].size(-1))[pass_tokens],
-            targets_dose_idx.reshape(-1)[pass_tokens],
-            ignore_index=-1
-        )
+        # 3. TOTAL Regression Loss
+        targets_total_float = targets_total.float()
+        total_target_raw = targets_total_float.reshape(-1)[pass_tokens]  # (N,) target
         
-        # 3. TOTAL Cross-Entropy Loss
-        loss_total = F.cross_entropy(
-            logits['total'].reshape(-1, logits['total'].size(-1))[pass_tokens],
-            targets_total.reshape(-1)[pass_tokens],
-            ignore_index=-1
-        )
+        # 정규화: 0-550 → 0-1 (학습 안정성)
+        total_scale = 550.0
+        total_target = total_target_raw / total_scale
         
-        # 4. UNIT Cross-Entropy Loss
-        loss_unit = F.cross_entropy(
-            logits['unit'].reshape(-1, logits['unit'].size(-1))[pass_tokens],
-            targets_unit.reshape(-1)[pass_tokens],
-            ignore_index=-1
-        )
+        # Weighted Huber Loss: non-zero에 더 큰 가중치
+        total_weight = torch.where(total_target > 0, 2.0, 1.0)
+
+        # ============================================================
+        # Drug-Conditioned TOTAL Loss (if available)
+        # ============================================================
+        if 'total_drug_cond' in logits and self.config.use_drug_conditioning:
+            # Use drug-conditioned prediction
+            total_pred_raw = logits['total_drug_cond'].reshape(-1)[pass_tokens]
+            total_pred = torch.clamp(total_pred_raw, min=0.0, max=total_scale) / total_scale
+            total_huber = F.smooth_l1_loss(total_pred, total_target, reduction='none')
+            loss_total = (total_weight * total_huber).mean()
+        else:
+            # Fallback: standard TOTAL head
+            total_pred_raw = logits['total'].reshape(-1)[pass_tokens]
+            total_pred = torch.clamp(total_pred_raw, min=0.0, max=total_scale) / total_scale
+            total_huber = F.smooth_l1_loss(total_pred, total_target, reduction='none')
+            loss_total = (total_weight * total_huber).mean()
         
-        # 5. Time-to-Event Loss (기존 Delphi와 동일)
-        time_logits = logits['time']
-        lse = torch.logsumexp(time_logits, -1)
-        lse = -torch.log(torch.exp(-lse) + self.config.t_min)
+        # 4. Time-to-Event Loss
+        # dt = time difference (days until next event)
         dt = torch.clamp(targets_age - age, min=1.0)
         
         if self.config.mask_ties:
@@ -913,25 +1165,86 @@ class CompositeDelphi(nn.Module):
                 .max(-1).indices.squeeze((1, 2))
             )
         
-        ldt = -torch.log(dt + self.config.t_min).view(-1)
-        loss_time = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - ldt.reshape(-1)))
-        loss_time = torch.mean(loss_time[pass_tokens])
+        time_distribution = getattr(self.config, 'time_distribution', 'exponential')
+        
+        if time_distribution == 'weibull':
+            # ============================================================
+            # Weibull Distribution Loss (수치 안정성 강화 v2)
+            # ============================================================
+            # PDF: f(t) = (k/λ) * (t/λ)^(k-1) * exp(-(t/λ)^k)
+            # log f(t) = log(k) - k*log(λ) + (k-1)*log(t) - (t/λ)^k
+            
+            # Use DATA logits for scale parameter (consistent with exponential)
+            data_logits = logits['data']  # (B, T, data_vocab_size)
+            time_shape = logits['time_shape']  # (B, T, vocab_size) - k (positive)
+            
+            # λ = exp(logsumexp) ensures positivity
+            log_scale = torch.logsumexp(data_logits, -1)  # (B, T)
+            scale = torch.clamp(torch.exp(log_scale), min=1.0, max=365.0)  # 1일~1년 범위로 제한
+            
+            # k = weighted mean shape (clamp for stability)
+            event_probs = F.softmax(data_logits, dim=-1)  # (B, T, vocab_size)
+            shape = torch.clamp((event_probs * time_shape).sum(-1), min=0.5, max=5.0)  # 더 좁은 범위
+            
+            # Weibull negative log-likelihood with numerical stability
+            dt_flat = torch.clamp(dt.view(-1), min=1.0)  # 최소 1일
+            scale_flat = scale.view(-1)
+            shape_flat = shape.view(-1)
+            
+            # Compute log-likelihood components separately for numerical stability
+            log_shape = torch.log(shape_flat)
+            log_scale = torch.log(scale_flat)
+            log_dt = torch.log(dt_flat)
+            
+            # (dt/scale)^k = exp(k * log(dt/scale))
+            log_ratio = log_dt - log_scale  # log(dt/scale)
+            power_term = torch.exp(shape_flat * log_ratio)  # (dt/scale)^k
+            
+            # Clamp power term to prevent explosion
+            power_term = torch.clamp(power_term, max=50.0)
+            
+            log_likelihood = (
+                log_shape - 
+                shape_flat * log_scale + 
+                (shape_flat - 1) * log_dt - 
+                power_term
+            )
+            
+            # Negative log-likelihood (loss)
+            # Clamp to reasonable range and only use valid tokens
+            nll = -log_likelihood[pass_tokens]
+            loss_time = torch.clamp(nll, min=0.0, max=20.0).mean()
+            
+        else:
+            # ============================================================
+            # Exponential Distribution Loss (기존 Delphi와 동일)
+            # ============================================================
+            # PDF: f(t) = λ * exp(-λt)
+            # log f(t) = log(λ) - λt
+            
+            # Use DATA logits for time calculation (original Delphi approach)
+            # This makes sense because time-to-event is directly related to disease prediction
+            data_logits = logits['data']  # (B, T, data_vocab_size)
+            lse = torch.logsumexp(data_logits, -1)  # (B, T)
+            lse = -torch.log(torch.exp(-lse) + self.config.t_min)
+            
+            ldt = -torch.log(dt + self.config.t_min).view(-1)
+            loss_time = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - ldt.reshape(-1)))
+            loss_time = torch.mean(loss_time[pass_tokens])
         
         # Weighted sum of losses
         total_loss = (
             self.config.loss_weight_data * loss_data +
-            self.config.loss_weight_dose * loss_dose +
+            self.config.loss_weight_shift * loss_shift +
             self.config.loss_weight_total * loss_total +
-            self.config.loss_weight_unit * loss_unit +
             self.config.loss_weight_time * loss_time
         )
         
         return {
             'loss': total_loss,
             'loss_data': loss_data,
-            'loss_dose': loss_dose,
+            'loss_shift': loss_shift,
             'loss_total': loss_total,
-            'loss_unit': loss_unit,
             'loss_time': loss_time
         }
     
@@ -958,21 +1271,23 @@ class CompositeDelphi(nn.Module):
                     # Any other weight parameter defaults to decay
                     decay.add(fpn)
         
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        
         # Handle weight tying: multi_head.data_head.weight is tied to composite_emb.data_emb.weight (Embedding)
-        # So it should be in no_decay, not decay
+        # The actual parameter is composite_emb.data_emb.weight, which is already in no_decay (Embedding)
+        # So we just need to remove multi_head.data_head.weight from decay if it exists
         if 'multi_head.data_head.weight' in decay:
             decay.discard('multi_head.data_head.weight')
-        if 'multi_head.data_head.weight' not in no_decay:
-            no_decay.add('multi_head.data_head.weight')
-        
-        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # Don't add it to no_decay if it doesn't exist in param_dict (due to weight tying)
         
         # Check for overlapping parameters and resolve
         inter_params = decay & no_decay
         if inter_params:
-            print(f"Warning: Found {len(inter_params)} parameters in both decay and no_decay, moving to no_decay:")
-            for pn in sorted(inter_params):
-                print(f"  {pn}")
+            if _is_master():
+                print(f"Warning: Found {len(inter_params)} parameters in both decay and no_decay, moving to no_decay:")
+                for pn in sorted(inter_params):
+                    print(f"  {pn}")
+            for pn in list(inter_params):
                 decay.discard(pn)
         
         union_params = decay | no_decay
@@ -980,31 +1295,41 @@ class CompositeDelphi(nn.Module):
         # Find missing parameters
         missing_params = param_dict.keys() - union_params
         if missing_params:
-            print(f"Warning: Found {len(missing_params)} unclassified parameters, adding to no_decay:")
-            for pn in sorted(missing_params):
-                print(f"  {pn}")
+            if _is_master():
+                print(f"Warning: Found {len(missing_params)} unclassified parameters, adding to no_decay:")
+                for pn in sorted(missing_params):
+                    print(f"  {pn}")
+            for pn in missing_params:
                 no_decay.add(pn)
         
-        # Final check
+        # Final check - only check params that actually exist
         union_params = decay | no_decay
         inter_params = decay & no_decay
         assert len(inter_params) == 0, f"Still have overlapping params: {inter_params}"
-        assert len(param_dict.keys() - union_params) == 0, f"Missing params: {param_dict.keys() - union_params}"
+        
+        # Only check params that exist in param_dict
+        missing_in_union = param_dict.keys() - union_params
+        assert len(missing_in_union) == 0, f"Missing params: {missing_in_union}"
+        
+        # Only include params that exist in param_dict
+        decay_filtered = [pn for pn in sorted(list(decay)) if pn in param_dict]
+        no_decay_filtered = [pn for pn in sorted(list(no_decay)) if pn in param_dict]
         
         optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
-            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+            {"params": [param_dict[pn] for pn in decay_filtered], "weight_decay": weight_decay},
+            {"params": [param_dict[pn] for pn in no_decay_filtered], "weight_decay": 0.0},
         ]
         
         use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
-        print(f"using fused AdamW: {use_fused}")
+        if _is_master():
+            print(f"using fused AdamW: {use_fused}")
         extra_args = dict(fused=True) if use_fused else dict()
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
         
         return optimizer
     
     @torch.no_grad()
-    def generate(self, data, dose, total, unit, age, 
+    def generate(self, data, shift, total, age, 
                  max_new_tokens=100, max_age=85*365.25,
                  no_repeat=True, termination_tokens=None):
         """Generate composite sequences"""
@@ -1018,13 +1343,12 @@ class CompositeDelphi(nn.Module):
             max_new_tokens = 128
         
         for _ in range(max_new_tokens):
-            logits, _, _ = self(data, dose, total, unit, age)
+            logits, _, _ = self(data, shift, total, age)
             
             # Get last position logits
             data_logits = logits['data'][:, -1, :]
-            dose_logits = logits['dose'][:, -1, :]
+            shift_logits = logits['shift'][:, -1, :]
             total_logits = logits['total'][:, -1, :]
-            unit_logits = logits['unit'][:, -1, :]
             time_logits = logits['time'][:, -1, :]
             
             # Mask ignored tokens
@@ -1045,16 +1369,14 @@ class CompositeDelphi(nn.Module):
             data_next = t_next[1][:, None]
             age_next = age[..., [-1]] + t_next[0][:, None]
             
-            # Sample dose, total, unit from their distributions
-            dose_next = torch.argmax(dose_logits, dim=-1, keepdim=True)
+            # Sample shift, total from their distributions
+            shift_next = torch.argmax(shift_logits, dim=-1, keepdim=True)
             total_next = torch.argmax(total_logits, dim=-1, keepdim=True)
-            unit_next = torch.argmax(unit_logits, dim=-1, keepdim=True)
             
             # Append to sequences
             data = torch.cat((data, data_next), dim=1)
-            dose = torch.cat((dose, dose_next.float()), dim=1)
+            shift = torch.cat((shift, shift_next), dim=1)
             total = torch.cat((total, total_next), dim=1)
-            unit = torch.cat((unit, unit_next), dim=1)
             age = torch.cat((age, age_next), dim=1)
             
             # Check termination
@@ -1064,5 +1386,4 @@ class CompositeDelphi(nn.Module):
             ).all():
                 break
         
-        return data, dose, total, unit, age, logits
-
+        return data, shift, total, age, logits
