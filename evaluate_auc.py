@@ -616,60 +616,30 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
         if len(all_predictions_shift_drug_cond) > 0:
             shift_pred_drug = all_predictions_shift_drug_cond
             shift_target_drug = all_targets_shift_drug_cond
-            
-            # Get unique classes from both target and prediction (intersection to avoid warnings)
-            unique_drug_target_classes = np.unique(shift_target_drug)
-            unique_drug_pred_classes = np.unique(shift_pred_drug)
-            # Use intersection to avoid warnings about classes not in y_true
-            unique_drug_classes = np.intersect1d(unique_drug_target_classes, unique_drug_pred_classes)
-            unique_drug_classes = np.sort(unique_drug_classes)
-            
-            # If no overlap, use target classes only
-            if len(unique_drug_classes) == 0:
-                unique_drug_classes = np.sort(unique_drug_target_classes)
-            
-            # Filter predictions and targets to only include classes that exist in both
-            # This prevents warnings about classes in y_pred not in y_true
-            valid_mask = np.isin(shift_target_drug, unique_drug_classes) & np.isin(shift_pred_drug, unique_drug_classes)
-            
-            if valid_mask.sum() > 0:
-                shift_target_drug_filtered = shift_target_drug[valid_mask]
-                shift_pred_drug_filtered = shift_pred_drug[valid_mask]
-                
-                results['shift_accuracy_drug_cond'] = accuracy_score(shift_target_drug_filtered, shift_pred_drug_filtered)
-                results['shift_balanced_accuracy_drug_cond'] = balanced_accuracy_score(shift_target_drug_filtered, shift_pred_drug_filtered)
-                results['shift_f1_macro_drug_cond'] = f1_score(shift_target_drug_filtered, shift_pred_drug_filtered, average='macro', zero_division=0)
-                results['shift_f1_micro_drug_cond'] = f1_score(shift_target_drug_filtered, shift_pred_drug_filtered, average='micro', zero_division=0)
-                results['shift_f1_weighted_drug_cond'] = f1_score(shift_target_drug_filtered, shift_pred_drug_filtered, average='weighted', zero_division=0)
-                results['shift_precision_macro_drug_cond'] = precision_score(shift_target_drug_filtered, shift_pred_drug_filtered, average='macro', zero_division=0)
-                results['shift_recall_macro_drug_cond'] = recall_score(shift_target_drug_filtered, shift_pred_drug_filtered, average='macro', zero_division=0)
-                results['shift_support_drug_cond'] = int(len(shift_target_drug_filtered))
-                
-                # Drug-conditioned confusion matrix - use intersection classes only
-                cm_drug = confusion_matrix(shift_target_drug_filtered, shift_pred_drug_filtered, labels=unique_drug_classes)
-            else:
-                # Fallback: use all data but only classes that exist in target
-                results['shift_accuracy_drug_cond'] = accuracy_score(shift_target_drug, shift_pred_drug)
-                results['shift_balanced_accuracy_drug_cond'] = balanced_accuracy_score(shift_target_drug, shift_pred_drug)
-                results['shift_f1_macro_drug_cond'] = f1_score(shift_target_drug, shift_pred_drug, average='macro', zero_division=0)
-                results['shift_f1_micro_drug_cond'] = f1_score(shift_target_drug, shift_pred_drug, average='micro', zero_division=0)
-                results['shift_f1_weighted_drug_cond'] = f1_score(shift_target_drug, shift_pred_drug, average='weighted', zero_division=0)
-                results['shift_precision_macro_drug_cond'] = precision_score(shift_target_drug, shift_pred_drug, average='macro', zero_division=0)
-                results['shift_recall_macro_drug_cond'] = recall_score(shift_target_drug, shift_pred_drug, average='macro', zero_division=0)
-                results['shift_support_drug_cond'] = int(len(shift_target_drug))
-                
-                # Use target classes only to avoid warnings
-                cm_drug = confusion_matrix(shift_target_drug, shift_pred_drug, labels=unique_drug_classes)
-                shift_target_drug_filtered = shift_target_drug
-                shift_pred_drug_filtered = shift_pred_drug
-            
-            # Store confusion matrix and per-class metrics (common for both branches)
+
+            shift_vocab_size = getattr(model.config, "shift_vocab_size", 5)
+            shift_ignore_index = int(getattr(model.config, "shift_ignore_index", 0))
+            class_labels = np.arange(shift_vocab_size)
+            class_labels = class_labels[class_labels != shift_ignore_index]
+
+            results['shift_accuracy_drug_cond'] = accuracy_score(shift_target_drug, shift_pred_drug)
+            results['shift_balanced_accuracy_drug_cond'] = balanced_accuracy_score(shift_target_drug, shift_pred_drug)
+            results['shift_f1_macro_drug_cond'] = f1_score(shift_target_drug, shift_pred_drug, average='macro', zero_division=0)
+            results['shift_f1_micro_drug_cond'] = f1_score(shift_target_drug, shift_pred_drug, average='micro', zero_division=0)
+            results['shift_f1_weighted_drug_cond'] = f1_score(shift_target_drug, shift_pred_drug, average='weighted', zero_division=0)
+            results['shift_precision_macro_drug_cond'] = precision_score(shift_target_drug, shift_pred_drug, average='macro', zero_division=0)
+            results['shift_recall_macro_drug_cond'] = recall_score(shift_target_drug, shift_pred_drug, average='macro', zero_division=0)
+            results['shift_support_drug_cond'] = int(len(shift_target_drug))
+
+            cm_drug = confusion_matrix(shift_target_drug, shift_pred_drug, labels=class_labels)
+
+            # Store confusion matrix and per-class metrics (fixed class list)
             results['shift_confusion_matrix_drug_cond'] = cm_drug.tolist()
-            results['shift_confusion_matrix_drug_cond_classes'] = unique_drug_classes.tolist()
-            
+            results['shift_confusion_matrix_drug_cond_classes'] = class_labels.tolist()
+
             # Per-class metrics for drug-conditioned predictions
             per_class_metrics_drug = {}
-            for i, cls in enumerate(unique_drug_classes):
+            for i, cls in enumerate(class_labels):
                 tp = cm_drug[i, i]
                 fp = cm_drug[:, i].sum() - tp
                 fn = cm_drug[i, :].sum() - tp
