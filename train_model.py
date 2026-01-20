@@ -119,6 +119,7 @@ mask_ties = True
 ignore_tokens = [0]
 data_fraction = 1.0
 no_event_token_rate = 5
+apply_token_shift = False
 
 # Time-to-Event distribution: 'exponential' or 'weibull'
 time_distribution = 'exponential'
@@ -404,7 +405,8 @@ def estimate_loss_composite():
             batch = get_batch_composite(ix, data, p2i, block_size=block_size,
                                         device=device, select='left',
                                         no_event_token_rate=no_event_token_rate,
-                                        cut_batch=True)
+                                        cut_batch=True,
+                                        apply_token_shift=apply_token_shift)
             x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
             
             with ctx:
@@ -475,7 +477,8 @@ if model_type == 'composite':
     ix = torch.randint(len(train_p2i), (batch_size,))
     batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
                                 padding='random', lifestyle_augmentations=True, select='left',
-                                no_event_token_rate=no_event_token_rate)
+                                no_event_token_rate=no_event_token_rate,
+                                apply_token_shift=apply_token_shift)
     x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
 else:
     ix = torch.randint(len(train_p2i), (batch_size,))
@@ -590,7 +593,8 @@ while True:
             ix = torch.randint(len(train_p2i), (batch_size,))
             batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
                                         padding='random', lifestyle_augmentations=True, select='left',
-                                        no_event_token_rate=no_event_token_rate, cut_batch=True)
+                                        no_event_token_rate=no_event_token_rate, cut_batch=True,
+                                        apply_token_shift=apply_token_shift)
             x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
             
             # Total loss
