@@ -156,8 +156,8 @@ def get_batch(ix, data, p2i, select='center', index='patient', padding='regular'
 
 
 def get_batch_composite(ix, data, p2i, select='center', index='patient', padding='regular',
-                        block_size=48, device='cpu', lifestyle_augmentations=False, 
-                        no_event_token_rate=5, cut_batch=False):
+                        block_size=48, device='cpu', lifestyle_augmentations=False,
+                        no_event_token_rate=5, cut_batch=False, apply_token_shift=True):
     """
     Get a batch of composite data (DATA, SHIFT, TOTAL) from the dataset.
     
@@ -173,6 +173,7 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
         lifestyle_augmentations: whether to perform augmentations
         no_event_token_rate: average rate of "no event" tokens in years
         cut_batch: whether to cut the batch to the smallest size possible
+        apply_token_shift: whether to shift tokens by +1 to reserve 0 for padding
 
     Returns:
         x_data: input DATA tokens (B, T)
@@ -243,9 +244,13 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
     n_pad = pad.shape[1]
 
     # Stack "no event" tokens with real tokens
-    data_tokens = torch.hstack([data_tokens, torch.zeros(len(ix), n_pad, dtype=torch.long)])  # 0 = no event
-    shift_values = torch.hstack([shift_values, torch.zeros(len(ix), n_pad, dtype=torch.long)])
-    total_values = torch.hstack([total_values, torch.zeros(len(ix), n_pad, dtype=torch.long)])
+    no_event_token = 0 if apply_token_shift else 1
+    data_tokens = torch.hstack([
+        data_tokens,
+        torch.full((len(ix), n_pad), no_event_token, dtype=torch.long),
+    ])
+    shift_values = torch.hstack([shift_values, torch.full((len(ix), n_pad), no_event_token, dtype=torch.long)])
+    total_values = torch.hstack([total_values, torch.full((len(ix), n_pad), no_event_token, dtype=torch.long)])
     ages = torch.hstack([ages, pad])
 
     # Mask out tokens that are too far in the future
@@ -262,9 +267,14 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
     ages = torch.gather(ages, 1, s)
 
     # Shift tokens by 1 (0 is reserved for padding)
-    data_tokens = data_tokens + 1
-    shift_values = shift_values + 1
-    total_values = total_values + 1
+    if apply_token_shift:
+        data_tokens = data_tokens + 1
+        shift_values = shift_values + 1
+        total_values = total_values + 1
+    else:
+        data_tokens = data_tokens.clamp_min(0)
+        shift_values = shift_values.clamp_min(0)
+        total_values = total_values.clamp_min(0)
 
     # Cut padded tokens if possible
     if cut_batch:
