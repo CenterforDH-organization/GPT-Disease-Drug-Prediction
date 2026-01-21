@@ -68,14 +68,14 @@ total_vocab_size = 552   # TOTAL: Embedding vocab (Regression output은 dim=1) -
 
 # SHIFT imbalance handling (if needed)
 # - SHIFT=0 is padding/unknown in this dataset
-shift_loss_type = 'ce'           # 'ce' or 'focal'
+shift_loss_type = 'focal'           # 'ce' or 'focal'
 shift_ignore_index = 0
-shift_focal_gamma = 2.0
+shift_focal_gamma = 3.0
 shift_class_weights = []  # Empty list = unweighted
 
 # Loss weights for composite model
 loss_weight_data = 1.0
-loss_weight_shift = 0.5
+loss_weight_shift = 1.0
 loss_weight_total = 0.5
 loss_weight_time = 1.0
 
@@ -119,6 +119,7 @@ mask_ties = True
 ignore_tokens = [0]
 data_fraction = 1.0
 no_event_token_rate = 5
+apply_token_shift = False
 
 # Time-to-Event distribution: 'exponential' or 'weibull'
 time_distribution = 'exponential'
@@ -164,6 +165,16 @@ torch.set_default_dtype(ptdtype)
 
 # data_dir = '../data'
 
+def _compute_shift_class_weights(shift_values, shift_vocab_size, shift_ignore_index):
+    counts = np.bincount(shift_values, minlength=shift_vocab_size).astype(np.float64)
+    if shift_ignore_index is not None and 0 <= shift_ignore_index < shift_vocab_size:
+        counts[shift_ignore_index] = 0.0
+    nonzero = counts > 0
+    weights = np.zeros(shift_vocab_size, dtype=np.float32)
+    if nonzero.any():
+        weights[nonzero] = counts[nonzero].sum() / (counts[nonzero] * nonzero.sum())
+    return weights.tolist()
+
 if model_type == 'composite':
     # 6-column structured data: (ID, AGE, DATA, DOSE, TOTAL, UNIT)
     # composite_dtype = np.dtype([
@@ -194,6 +205,21 @@ if model_type == 'composite':
     
     print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
     print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
+
+    if not shift_class_weights:
+        drug_token_min = 1279 if apply_token_shift else 1278
+        drug_token_max = 1289 if apply_token_shift else 1288
+        drug_mask = (train_data['DATA'] >= drug_token_min) & (train_data['DATA'] <= drug_token_max)
+        shift_values = train_data['SHIFT'][drug_mask].astype(np.int64)
+        if apply_token_shift:
+            shift_values = shift_values + 1
+        shift_class_weights = _compute_shift_class_weights(
+            shift_values,
+            shift_vocab_size,
+            shift_ignore_index,
+        )
+        shift_class_weights[4] *= 2.0
+        print(f"Computed shift class weights (drug-token subset): {shift_class_weights}")
 else:
     # 3-column data: (ID, AGE, TOKEN)
     train_data = np.memmap(os.path.join(data_dir, TRAIN_DATA_PATH), dtype=np.uint32, mode='r').reshape(-1, 3)
@@ -385,7 +411,8 @@ def estimate_loss_composite():
             batch = get_batch_composite(ix, data, p2i, block_size=block_size,
                                         device=device, select='left',
                                         no_event_token_rate=no_event_token_rate,
-                                        cut_batch=True)
+                                        cut_batch=True,
+                                        apply_token_shift=apply_token_shift)
             x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
             
             with ctx:
@@ -456,7 +483,8 @@ if model_type == 'composite':
     ix = torch.randint(len(train_p2i), (batch_size,))
     batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
                                 padding='random', lifestyle_augmentations=True, select='left',
-                                no_event_token_rate=no_event_token_rate)
+                                no_event_token_rate=no_event_token_rate,
+                                apply_token_shift=apply_token_shift)
     x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
 else:
     ix = torch.randint(len(train_p2i), (batch_size,))
@@ -486,9 +514,16 @@ while True:
             val_loss_unpooled = 0.1 * losses['val'] + 0.9 * val_loss_unpooled
             val_loss = val_loss_unpooled[0].item()  # Total loss
             
-            print(f"step {iter_num}: train loss {losses['train'][0].item():.4f}, val loss {losses['val'][0].item():.4f} ({val_loss:.4f})")
-            print(f"  breakdown - data: {val_loss_unpooled[1].item():.4f}, shift: {val_loss_unpooled[2].item():.4f}, "
-                  f"total: {val_loss_unpooled[3].item():.4f}, time: {val_loss_unpooled[4].item():.4f}")
+            train_breakdown = losses['train']
+            val_breakdown = losses['val']
+            print(f"step {iter_num}: train loss {train_breakdown[0].item():.4f}, val loss {val_breakdown[0].item():.4f} (ema {val_loss:.4f})")
+            print(
+                "  breakdown (train/val) - "
+                f"data: {train_breakdown[1].item():.4f}/{val_breakdown[1].item():.4f}, "
+                f"shift: {train_breakdown[2].item():.4f}/{val_breakdown[2].item():.4f}, "
+                f"total: {train_breakdown[3].item():.4f}/{val_breakdown[3].item():.4f}, "
+                f"time: {train_breakdown[4].item():.4f}/{val_breakdown[4].item():.4f}"
+            )
             
             if wandb_log:
                 wandb.log({
@@ -564,7 +599,8 @@ while True:
             ix = torch.randint(len(train_p2i), (batch_size,))
             batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
                                         padding='random', lifestyle_augmentations=True, select='left',
-                                        no_event_token_rate=no_event_token_rate, cut_batch=True)
+                                        no_event_token_rate=no_event_token_rate, cut_batch=True,
+                                        apply_token_shift=apply_token_shift)
             x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
             
             # Total loss
