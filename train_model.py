@@ -70,7 +70,7 @@ total_vocab_size = 552   # TOTAL: Embedding vocab (Regression output은 dim=1) -
 # - SHIFT=0 is padding/unknown in this dataset
 shift_loss_type = 'focal'           # 'ce' or 'focal'
 shift_ignore_index = 0
-shift_focal_gamma = 2.0
+shift_focal_gamma = 3.0
 shift_class_weights = []  # Empty list = unweighted
 
 # Loss weights for composite model
@@ -207,13 +207,18 @@ if model_type == 'composite':
     print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
 
     if not shift_class_weights:
-        shift_values = train_data['SHIFT'].astype(np.int64) + 1
+        drug_token_min = 1279 if apply_token_shift else 1278
+        drug_token_max = 1289 if apply_token_shift else 1288
+        drug_mask = (train_data['DATA'] >= drug_token_min) & (train_data['DATA'] <= drug_token_max)
+        shift_values = train_data['SHIFT'][drug_mask].astype(np.int64)
+        if apply_token_shift:
+            shift_values = shift_values + 1
         shift_class_weights = _compute_shift_class_weights(
             shift_values,
             shift_vocab_size,
             shift_ignore_index,
         )
-        print(f"Computed shift class weights: {shift_class_weights}")
+        print(f"Computed shift class weights (drug-token subset): {shift_class_weights}")
 else:
     # 3-column data: (ID, AGE, TOKEN)
     train_data = np.memmap(os.path.join(data_dir, TRAIN_DATA_PATH), dtype=np.uint32, mode='r').reshape(-1, 3)
