@@ -218,6 +218,7 @@ if model_type == 'composite':
             shift_vocab_size,
             shift_ignore_index,
         )
+        shift_class_weights[4] *= 2.0
         print(f"Computed shift class weights (drug-token subset): {shift_class_weights}")
 else:
     # 3-column data: (ID, AGE, TOKEN)
