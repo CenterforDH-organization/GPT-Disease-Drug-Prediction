@@ -42,44 +42,30 @@ block_size = 512
 model_type = 'composite'
 
 # Modern Delphi model config (3-column data)
-n_layer = 6
+n_layer = 8          # Scaled up from 6
 n_head = 6
-n_kv_head = 2  # GQA (must divide n_head evenly: 12/4=3)
-n_embd = 96
+n_kv_head = 2  # GQA (must divide n_head evenly: 6/2=3 heads per group)
+n_embd = 192         # Scaled up from 96 for better capacity
 dropout = 0.3
 bias = False
 vocab_size = 1290  # Must include Death token (raw 1288 → shifted 1289)
 
 # Composite Delphi model config (5-column data)
-# Drug tokens mapping (labels.csv 0-indexed, verified from actual data):
-#   Metformin(1278), Sulfonylurea(1279), DPP-4(1280), Insulin(1281), Meglitinide(1282),
-#   Thiazolidinedione(1283), Alpha-glucosidase(1284), GLP-1(1285), SGLT-2(1286), Other(1287), Death(1288)
-# After +1 shift in get_batch_composite: shifted tokens are 1279-1289 → vocab_size >= 1290
-# NOTE: GLP-1(1285→1286), SGLT-2(1286→1287), Other(1287→1288) do NOT exist in kr_train data!
-#       Death(1288→1289) exists in train/test/val.
-#
-# Head 구조:
-# - DATA: Linear(n_embd, 1290) → Softmax + Cross-Entropy (includes Death token)
-# - SHIFT: Linear(n_embd, shift_vocab_size) → Softmax + Cross-Entropy (Classification)
-# - TOTAL: Linear(n_embd, 1) → Regression + Weighted Huber Loss
-data_vocab_size = 1290   # DATA: 약품/질병 코드 수 (Classification) - +1 for shift in get_batch_composite
-shift_vocab_size = 5     # SHIFT: Embedding & head vocab (Classification) - values 0-3, after +1 shift: 1-4 → vocab_size=5
-total_vocab_size = 552   # TOTAL: Embedding vocab (Regression output은 dim=1) - +1 for shift
+data_vocab_size = 1290   # DATA: 약품/질병 코드 수 (Classification)
+shift_vocab_size = 5     # SHIFT: Classification (values 0-4)
+total_vocab_size = 552   # TOTAL: Embedding vocab
 
-# SHIFT imbalance handling (if needed)
-# - SHIFT=0 is padding/unknown in this dataset
+# SHIFT imbalance handling
 shift_loss_type = 'focal'           # 'ce' or 'focal'
 shift_ignore_index = 0
 shift_focal_gamma = 3.0
 shift_class_weights = []  # Empty list = unweighted
 
 # Loss weights for composite model
-# NOTE: loss_weight_total scaled up significantly because TOTAL loss is tiny (0-1 normalized)
-# NOTE: loss_weight_time reduced to prevent TIME loss from dominating
 loss_weight_data = 1.0
 loss_weight_shift = 1.0
-loss_weight_total = 100.0  # Was 0.5, increased to ensure gradient flow
-loss_weight_time = 0.1     # Was 1.0, reduced to prevent dominance
+loss_weight_total = 100.0
+loss_weight_time = 0.1
 
 # modern features
 use_moe = True
@@ -87,15 +73,13 @@ num_experts = 8
 experts_per_token = 2
 sliding_window = 128
 
-# Drug-conditioning: 약물 정보를 조건으로 SHIFT/TOTAL 예측 성능 향상
-# FiLM (Feature-wise Linear Modulation) 방식 사용
-# Drug tokens: 1279-1289 (after +1 shift: Metformin~Death)
+# Drug-conditioning
 use_drug_conditioning = True
 rope_theta = 10000.0
 
 # adamw optimizer
 learning_rate = 6e-4
-max_iters = 10000
+max_iters = 20000        # Increased from 10000
 # max_iters = 2000
 weight_decay = 1e-1
 beta1 = 0.9
@@ -105,13 +89,14 @@ grad_clip = 1.0
 # learning rate decay settings
 decay_lr = True
 warmup_iters = 1000
-lr_decay_iters = 9000
+lr_decay_iters = 19000   # Adjusted for 20000 max_iters
 min_lr = 3e-5
 
 # system
 gpu_id = 0  # GPU device ID (e.g., 0, 1, 2, ...)
 device = 'cpu'  # Will be set after config parsing
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+# dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
+dtype = 'float32'  # Force float32 for MPS stability on Mac
 compile = False  # torch.compile (requires PyTorch 2.0+)
 
 # delphi training
