@@ -113,6 +113,8 @@ time_distribution = 'exponential'
 
 TRAIN_DATA_PATH = '../data/kr_train.bin'
 VAL_DATA_PATH = '../data/kr_val.bin'
+# JMDC path for domain generalization (mixing)
+JMDC_DATA_PATH = '../data/JMDC_extval.bin'
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]
@@ -184,8 +186,37 @@ if model_type == 'composite':
     # train_data = np.memmap(TRAIN_DATA_PATH, dtype=composite_dtype, mode='r')
     # val_data = np.memmap(VAL_DATA_PATH, dtype=composite_dtype, mode='r')
 
-    train_data = np.fromfile(TRAIN_DATA_PATH, dtype=composite_dtype)
+    # 1. Load Main Data (KR Train)
+    train_data_kr = np.fromfile(TRAIN_DATA_PATH, dtype=composite_dtype)
     val_data = np.fromfile(VAL_DATA_PATH, dtype=composite_dtype)
+    
+    # 2. Load & Mix Auxiliary Data (JMDC for Domain Generalization)
+    if os.path.exists(JMDC_DATA_PATH):
+        print(f"Mixing JMDC data for domain generalization...")
+        jmdc_data = np.fromfile(JMDC_DATA_PATH, dtype=composite_dtype)
+        
+        # Sample 5% of JMDC data
+        mix_ratio = 0.05
+        n_jmdc = len(jmdc_data)
+        n_sample = int(n_jmdc * mix_ratio)
+        
+        # Random sampling
+        np.random.seed(seed)
+        indices = np.random.choice(n_jmdc, n_sample, replace=False)
+        jmdc_sample = jmdc_data[indices]
+        
+        # Concatenate: KR (95%+) + JMDC (5%)
+        # JMDC IDs might overlap with KR IDs, so we shift JMDC IDs to be unique.
+        max_kr_id = train_data_kr['ID'].max()
+        jmdc_sample['ID'] += (max_kr_id + 1)
+        
+        train_data = np.concatenate([train_data_kr, jmdc_sample])
+        print(f"  KR Train: {len(train_data_kr):,}")
+        print(f"  JMDC Mix ({mix_ratio*100:.0f}%): {len(jmdc_sample):,} (IDs shifted)")
+        print(f"  Total Train: {len(train_data):,}")
+    else:
+        print("JMDC data not found, skipping mixing.")
+        train_data = train_data_kr
     
     train_p2i = get_p2i_composite(train_data)
     val_p2i = get_p2i_composite(val_data)
@@ -193,20 +224,18 @@ if model_type == 'composite':
     print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
     print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
 
+    # 3. Manual Class Balancing (SHIFT)
+    # Problem: Model ignores minority classes (Decrease=1, Increase=3/4)
+    # Solution: Strong manual weights
     if not shift_class_weights:
-        drug_token_min = 1279 if apply_token_shift else 1278
-        drug_token_max = 1289 if apply_token_shift else 1288
-        drug_mask = (train_data['DATA'] >= drug_token_min) & (train_data['DATA'] <= drug_token_max)
-        shift_values = train_data['SHIFT'][drug_mask].astype(np.int64)
-        if apply_token_shift:
-            shift_values = shift_values + 1
-        shift_class_weights = _compute_shift_class_weights(
-            shift_values,
-            shift_vocab_size,
-            shift_ignore_index,
-        )
-        shift_class_weights[4] *= 2.0
-        print(f"Computed shift class weights (drug-token subset): {shift_class_weights}")
+        # Class 0: Padding (Ignore)
+        # Class 1: Decrease (Minority) → Weight 20.0 (Was ~4.0)
+        # Class 2: Maintain (Majority) → Weight 1.0 (Was ~0.4)
+        # Class 3: Increase (Minority) → Weight 20.0 (Was ~8.0)
+        # Class 4: Increase/Other (rare) → Weight 0.0
+        # Note: shift_vocab_size=5 (0~4)
+        shift_class_weights = [0.0, 20.0, 1.0, 20.0, 0.0]
+        print(f"Using manual shift class weights: {shift_class_weights}")
 else:
     # 3-column data: (ID, AGE, TOKEN)
     train_data = np.memmap(os.path.join(data_dir, TRAIN_DATA_PATH), dtype=np.uint32, mode='r').reshape(-1, 3)
