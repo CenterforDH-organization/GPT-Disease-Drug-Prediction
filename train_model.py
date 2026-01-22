@@ -74,10 +74,12 @@ shift_focal_gamma = 3.0
 shift_class_weights = []  # Empty list = unweighted
 
 # Loss weights for composite model
+# NOTE: loss_weight_total scaled up significantly because TOTAL loss is tiny (0-1 normalized)
+# NOTE: loss_weight_time reduced to prevent TIME loss from dominating
 loss_weight_data = 1.0
 loss_weight_shift = 1.0
-loss_weight_total = 0.5
-loss_weight_time = 1.0
+loss_weight_total = 100.0  # Was 0.5, increased to ensure gradient flow
+loss_weight_time = 0.1     # Was 1.0, reduced to prevent dominance
 
 # modern features
 use_moe = True
@@ -114,7 +116,7 @@ compile = False  # torch.compile (requires PyTorch 2.0+)
 
 # delphi training
 token_dropout = 0.0
-t_min = 0.0
+t_min = 0.1  # Prevent log(0) numerical instability
 mask_ties = True
 ignore_tokens = [0]
 data_fraction = 1.0
@@ -624,6 +626,17 @@ while True:
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+    # Gradient monitoring for debugging (every 1000 iters)
+    if iter_num % 1000 == 0 and model_type == 'composite':
+        grad_info = []
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if 'total_head' in name or 'time_head' in name or 'time_shape_head' in name:
+                    grad_norm = param.grad.norm().item()
+                    grad_info.append(f"{name.split('.')[-2]}={grad_norm:.6f}")
+        if grad_info:
+            print(f"  [GRAD DEBUG] {', '.join(grad_info)}")
 
     # Optimizer step
     scaler.step(optimizer)

@@ -803,6 +803,16 @@ class MultiHeadOutput(nn.Module):
                 nn.GELU(),
                 nn.Linear(config.n_embd // 2, 1)
             )
+            
+            # Initialize FiLM generators for identity transformation (gamma=1, beta=0)
+            # This ensures stable training start
+            for film_gen in [self.shift_film_generator, self.total_film_generator]:
+                last_layer = film_gen[-1]  # Last Linear layer
+                nn.init.zeros_(last_layer.weight)
+                # Initialize bias: first half (gamma) = 1, second half (beta) = 0
+                with torch.no_grad():
+                    last_layer.bias[:config.n_embd].fill_(1.0)  # gamma = 1
+                    last_layer.bias[config.n_embd:].zero_()      # beta = 0
         
         # Time Head: scale parameter (λ) for all event types
         self.time_head = nn.Linear(config.n_embd, config.data_vocab_size, bias=False)
@@ -812,13 +822,15 @@ class MultiHeadOutput(nn.Module):
             # Shape parameter per event type (more expressive)
             self.time_shape_head = nn.Linear(config.n_embd, config.data_vocab_size, bias=False)
         
-    def forward(self, x, drug_emb=None):
+    def forward(self, x, drug_emb=None, drug_token_mask=None):
         """
         Args:
             x: (B, T, n_embd) transformer output
             drug_emb: (B, T, n_embd) drug token embedding for conditioning (optional)
-                      - 학습 시: targets_data의 embedding (teacher forcing)
-                      - 추론 시: 예측된 data의 embedding 또는 None
+                      - 학습 시: INPUT data의 embedding (과거 정보)
+                      - 추론 시: 현재까지의 data의 embedding
+            drug_token_mask: (B, T) bool tensor, True where TARGET is a drug token
+                             FiLM only applies at these positions
         Returns:
             dict of logits/values for each head
         """
@@ -831,6 +843,7 @@ class MultiHeadOutput(nn.Module):
         
         # ============================================================
         # Drug-Conditioned Predictions (FiLM modulation)
+        # Only applies when target is a drug token (drug_token_mask=True)
         # ============================================================
         if self.use_drug_conditioning and drug_emb is not None:
             # SHIFT: FiLM modulation with drug embedding
@@ -838,14 +851,35 @@ class MultiHeadOutput(nn.Module):
             shift_gamma, shift_beta = shift_film.chunk(2, dim=-1)  # 각각 (B, T, n_embd)
             shift_modulated = shift_gamma * x + shift_beta  # FiLM: γ * x + β
             shift_drug_cond = self.shift_drug_cond_head(shift_modulated)  # (B, T, shift_vocab_size)
-            output['shift_drug_cond'] = shift_drug_cond
             
             # TOTAL: FiLM modulation with drug embedding
             total_film = self.total_film_generator(drug_emb)  # (B, T, n_embd*2)
             total_gamma, total_beta = total_film.chunk(2, dim=-1)  # 각각 (B, T, n_embd)
             total_modulated = total_gamma * x + total_beta  # FiLM: γ * x + β
             total_drug_cond = self.total_drug_cond_head(total_modulated).squeeze(-1)  # (B, T)
-            output['total_drug_cond'] = total_drug_cond
+            
+            # Apply drug token masking: only use FiLM output where target is a drug
+            if drug_token_mask is not None:
+                # Blend: use FiLM output for drug tokens, standard output otherwise
+                # SHIFT: (B, T, shift_vocab_size)
+                shift_drug_cond_masked = torch.where(
+                    drug_token_mask.unsqueeze(-1),  # (B, T, 1)
+                    shift_drug_cond,
+                    output['shift']
+                )
+                output['shift_drug_cond'] = shift_drug_cond_masked
+                
+                # TOTAL: (B, T)
+                total_drug_cond_masked = torch.where(
+                    drug_token_mask,  # (B, T)
+                    total_drug_cond,
+                    output['total']
+                )
+                output['total_drug_cond'] = total_drug_cond_masked
+            else:
+                # No mask: apply FiLM to all positions (backward compatibility)
+                output['shift_drug_cond'] = shift_drug_cond
+                output['total_drug_cond'] = total_drug_cond
         
         # For backward compatibility
         output['time'] = output['time_scale']
@@ -1031,20 +1065,33 @@ class CompositeDelphi(nn.Module):
         att = torch.stack(att_list) if att_list[0] is not None else None
         
         # 6. Multi-Head Output
-        # Drug-Conditioning: 학습 시 targets_data의 embedding을 조건으로 사용 (teacher forcing)
+        # Drug-Conditioning: FiLM modulation for SHIFT/TOTAL prediction
+        # CRITICAL FIX: 
+        #   - Use input `data` (current tokens), NOT `targets_data` (future tokens)
+        #   - This prevents information leakage during training
+        #   - FiLM learns to modulate predictions based on past drug history
         drug_emb = None
+        drug_token_mask = None
         if self.config.use_drug_conditioning:
-            drug_source = targets_data if targets_data is not None else drug_conditioning_data
+            # Get drug embedding from INPUT data (not targets!)
+            drug_source = data  # Current input tokens
             if drug_source is not None:
-                # clamp to valid range (same as in CompositeEmbedding)
+                # Clamp to valid range
                 drug_source_clamped = torch.clamp(
                     drug_source,
                     min=0,
                     max=self.composite_emb.data_emb.num_embeddings - 1,
                 )
                 drug_emb = self.composite_emb.data_emb(drug_source_clamped)
+            
+            # Create drug token mask: FiLM only applies when TARGET is a drug
+            # Drug tokens range (after +1 shift): 1279-1289
+            drug_token_min = getattr(self.config, 'drug_token_min', 1279)
+            drug_token_max = getattr(self.config, 'drug_token_max', 1289)
+            if targets_data is not None:
+                drug_token_mask = (targets_data >= drug_token_min) & (targets_data <= drug_token_max)
         
-        logits = self.multi_head(x, drug_emb=drug_emb)
+        logits = self.multi_head(x, drug_emb=drug_emb, drug_token_mask=drug_token_mask)
         
         # 7. Compute losses if targets provided
         if targets_data is not None:
@@ -1139,32 +1186,48 @@ class CompositeDelphi(nn.Module):
                     ignore_index=-1,
                 )
         
-        # 3. TOTAL Regression Loss
+        # 3. TOTAL Regression Loss (redesigned for better gradient flow)
+        # Problem: normalized 0-1 scale produced tiny gradients (~0.0002)
+        # Solution: Use raw scale (0-550) with MSE loss and asymmetric weighting
         targets_total_float = targets_total.float()
-        total_target_raw = targets_total_float.reshape(-1)[pass_tokens]  # (N,) target
+        total_target = targets_total_float.reshape(-1)[pass_tokens]  # (N,) target, raw scale
         
-        # 정규화: 0-550 → 0-1 (학습 안정성)
-        total_scale = 550.0
-        total_target = total_target_raw / total_scale
-        
-        # Weighted Huber Loss: non-zero에 더 큰 가중치
-        total_weight = torch.where(total_target > 0, 2.0, 1.0)
-
         # ============================================================
         # Drug-Conditioned TOTAL Loss (if available)
         # ============================================================
         if 'total_drug_cond' in logits and self.config.use_drug_conditioning:
             # Use drug-conditioned prediction
-            total_pred_raw = logits['total_drug_cond'].reshape(-1)[pass_tokens]
-            total_pred = torch.clamp(total_pred_raw, min=0.0, max=total_scale) / total_scale
-            total_huber = F.smooth_l1_loss(total_pred, total_target, reduction='none')
-            loss_total = (total_weight * total_huber).mean()
+            total_pred = logits['total_drug_cond'].reshape(-1)[pass_tokens]
         else:
             # Fallback: standard TOTAL head
-            total_pred_raw = logits['total'].reshape(-1)[pass_tokens]
-            total_pred = torch.clamp(total_pred_raw, min=0.0, max=total_scale) / total_scale
-            total_huber = F.smooth_l1_loss(total_pred, total_target, reduction='none')
-            loss_total = (total_weight * total_huber).mean()
+            total_pred = logits['total'].reshape(-1)[pass_tokens]
+        
+        # Clamp predictions to valid range (raw scale 0-550)
+        total_scale = 550.0
+        total_pred = torch.clamp(total_pred, min=0.0, max=total_scale)
+        
+        # Asymmetric weighting: non-zero targets get 10x weight
+        # This prevents model from just predicting 0 for everything
+        nonzero_mask = total_target > 0
+        zero_mask = ~nonzero_mask
+        
+        # MSE Loss (larger gradients than Huber on small values)
+        mse_all = (total_pred - total_target) ** 2
+        
+        # Compute weighted loss
+        if nonzero_mask.sum() > 0 and zero_mask.sum() > 0:
+            loss_nonzero = mse_all[nonzero_mask].mean()
+            loss_zero = mse_all[zero_mask].mean()
+            # Non-zero targets are much more important (10x weight)
+            loss_total = 0.9 * loss_nonzero + 0.1 * loss_zero
+        elif nonzero_mask.sum() > 0:
+            loss_total = mse_all[nonzero_mask].mean()
+        else:
+            loss_total = mse_all.mean()
+        
+        # Normalize by scale^2 to keep loss in reasonable range
+        # This makes loss ~1.0 instead of ~300000.0
+        loss_total = loss_total / (total_scale ** 2)
         
         # 4. Time-to-Event Loss
         # dt = time difference (days until next event)
