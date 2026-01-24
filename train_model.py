@@ -58,12 +58,12 @@ total_vocab_size = 552   # TOTAL: Embedding vocab
 # SHIFT imbalance handling
 shift_loss_type = 'focal'           # 'ce' or 'focal'
 shift_ignore_index = 0
-shift_focal_gamma = 3.0
+shift_focal_gamma = 5.0  # Increased from 3.0 for harder mining
 shift_class_weights = []  # Empty list = unweighted
 
 # Loss weights for composite model
 loss_weight_data = 1.0
-loss_weight_shift = 1.0
+loss_weight_shift = 15.0  # Increased from 5.0 to heavily emphasize SHIFT learning
 loss_weight_total = 100.0
 loss_weight_time = 0.1
 
@@ -186,37 +186,8 @@ if model_type == 'composite':
     # train_data = np.memmap(TRAIN_DATA_PATH, dtype=composite_dtype, mode='r')
     # val_data = np.memmap(VAL_DATA_PATH, dtype=composite_dtype, mode='r')
 
-    # 1. Load Main Data (KR Train)
-    train_data_kr = np.fromfile(TRAIN_DATA_PATH, dtype=composite_dtype)
+    train_data = np.fromfile(TRAIN_DATA_PATH, dtype=composite_dtype)
     val_data = np.fromfile(VAL_DATA_PATH, dtype=composite_dtype)
-    
-    # 2. Load & Mix Auxiliary Data (JMDC for Domain Generalization)
-    if os.path.exists(JMDC_DATA_PATH):
-        print(f"Mixing JMDC data for domain generalization...")
-        jmdc_data = np.fromfile(JMDC_DATA_PATH, dtype=composite_dtype)
-        
-        # Sample 5% of JMDC data
-        mix_ratio = 0.05
-        n_jmdc = len(jmdc_data)
-        n_sample = int(n_jmdc * mix_ratio)
-        
-        # Random sampling
-        np.random.seed(seed)
-        indices = np.random.choice(n_jmdc, n_sample, replace=False)
-        jmdc_sample = jmdc_data[indices]
-        
-        # Concatenate: KR (95%+) + JMDC (5%)
-        # JMDC IDs might overlap with KR IDs, so we shift JMDC IDs to be unique.
-        max_kr_id = train_data_kr['ID'].max()
-        jmdc_sample['ID'] += (max_kr_id + 1)
-        
-        train_data = np.concatenate([train_data_kr, jmdc_sample])
-        print(f"  KR Train: {len(train_data_kr):,}")
-        print(f"  JMDC Mix ({mix_ratio*100:.0f}%): {len(jmdc_sample):,} (IDs shifted)")
-        print(f"  Total Train: {len(train_data):,}")
-    else:
-        print("JMDC data not found, skipping mixing.")
-        train_data = train_data_kr
     
     train_p2i = get_p2i_composite(train_data)
     val_p2i = get_p2i_composite(val_data)
@@ -224,18 +195,55 @@ if model_type == 'composite':
     print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
     print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
 
-    # 3. Manual Class Balancing (SHIFT)
-    # Problem: Model ignores minority classes (Decrease=1, Increase=3/4)
-    # Solution: Strong manual weights
+    # Dynamic Class Weighting (SHIFT)
+    # Compute weights from drug-token subset to handle class imbalance
     if not shift_class_weights:
-        # Class 0: Padding (Ignore)
-        # Class 1: Decrease (Minority) → Weight 20.0 (Was ~4.0)
-        # Class 2: Maintain (Majority) → Weight 1.0 (Was ~0.4)
-        # Class 3: Increase (Minority) → Weight 20.0 (Was ~8.0)
-        # Class 4: Increase/Other (rare) → Weight 0.0
-        # Note: shift_vocab_size=5 (0~4)
-        shift_class_weights = [0.0, 20.0, 1.0, 20.0, 0.0]
-        print(f"Using manual shift class weights: {shift_class_weights}")
+        drug_token_min = 1279 if apply_token_shift else 1278
+        drug_token_max = 1289 if apply_token_shift else 1288
+        drug_mask = (train_data['DATA'] >= drug_token_min) & (train_data['DATA'] <= drug_token_max)
+        shift_values = train_data['SHIFT'][drug_mask].astype(np.int64)
+        if apply_token_shift:
+            shift_values = shift_values + 1
+        shift_class_weights = _compute_shift_class_weights(
+            shift_values,
+            shift_vocab_size,
+            shift_ignore_index,
+        )
+        print(f"Computed shift class weights (drug-token subset): {shift_class_weights}")
+
+    # ============================================================
+    # WeightedRandomSampler: Patient-level balanced sampling
+    # Oversample patients with minority SHIFT classes (Decrease/Increase)
+    # ============================================================
+    print("Computing patient-level sampling weights for SHIFT balancing...")
+    
+    # Minority SHIFT classes: 1 (Decrease), 3 (Increase) in raw encoding
+    # After +1 shift: 2 (Decrease), 4 (Increase)
+    minority_classes = [1, 3] if not apply_token_shift else [2, 4]
+    
+    # Compute per-patient minority SHIFT event count
+    patient_weights = np.zeros(len(train_p2i), dtype=np.float32)
+    for pid, (start_idx, length) in enumerate(train_p2i):
+        patient_data = train_data[start_idx:start_idx + length]
+        
+        # Only count SHIFT for drug tokens
+        drug_mask = (patient_data['DATA'] >= drug_token_min) & (patient_data['DATA'] <= drug_token_max)
+        patient_shifts = patient_data['SHIFT'][drug_mask]
+        
+        # Count minority class occurrences
+        minority_count = sum((patient_shifts == c).sum() for c in minority_classes)
+        
+        # Weight: 1 (base) + minority_count * boost_factor
+        # Patients with more minority events get higher sampling probability
+        patient_weights[pid] = 1.0 + minority_count * 5.0
+    
+    # Normalize to create probability distribution
+    patient_weights = patient_weights / patient_weights.sum()
+    patient_weights_tensor = torch.from_numpy(patient_weights)
+    
+    minority_patient_count = (patient_weights > 1.0 / len(train_p2i)).sum()
+    print(f"  Patients with minority SHIFT events: {minority_patient_count:,} / {len(train_p2i):,}")
+    print(f"  Max sampling weight: {patient_weights.max():.4f}, Min: {patient_weights.min():.6f}")
 else:
     # 3-column data: (ID, AGE, TOKEN)
     train_data = np.memmap(os.path.join(data_dir, TRAIN_DATA_PATH), dtype=np.uint32, mode='r').reshape(-1, 3)
@@ -494,9 +502,9 @@ print(f"  Max iterations: {max_iters}")
 print(f"  Learning rate: {learning_rate}")
 print(f"{'='*60}\n")
 
-# Initial batch
+# Initial batch (weighted sampling for SHIFT class balance)
 if model_type == 'composite':
-    ix = torch.randint(len(train_p2i), (batch_size,))
+    ix = torch.multinomial(patient_weights_tensor, batch_size, replacement=True)
     batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
                                 padding='random', lifestyle_augmentations=True, select='left',
                                 no_event_token_rate=no_event_token_rate,
@@ -611,8 +619,8 @@ while True:
                     y_data, y_shift, y_total, y_ages
                 )
             
-            # Prefetch next batch
-            ix = torch.randint(len(train_p2i), (batch_size,))
+            # Prefetch next batch (weighted sampling for SHIFT class balance)
+            ix = torch.multinomial(patient_weights_tensor, batch_size, replacement=True)
             batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
                                         padding='random', lifestyle_augmentations=True, select='left',
                                         no_event_token_rate=no_event_token_rate, cut_batch=True,

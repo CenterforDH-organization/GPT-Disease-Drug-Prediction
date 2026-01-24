@@ -769,7 +769,15 @@ class MultiHeadOutput(nn.Module):
         
         # Classification Heads (DATA, SHIFT)
         self.data_head = nn.Linear(config.n_embd, config.data_vocab_size, bias=False)
-        self.shift_head = nn.Linear(config.n_embd, config.shift_vocab_size, bias=False)
+        
+        # Strengthened SHIFT Head: 2-layer MLP + LayerNorm for better classification
+        # This gives the model more capacity to learn SHIFT patterns
+        self.shift_head = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd),
+            nn.GELU(),
+            nn.LayerNorm(config.n_embd),
+            nn.Linear(config.n_embd, config.shift_vocab_size)
+        )
         
         # Regression Head (TOTAL) - 출력 dim = 1
         self.total_head = nn.Linear(config.n_embd, 1, bias=True)
