@@ -58,7 +58,7 @@ total_vocab_size = 552   # TOTAL: Embedding vocab
 # SHIFT imbalance handling
 shift_loss_type = 'focal'           # 'ce' or 'focal'
 shift_ignore_index = 0
-shift_focal_gamma = 5.0  # Increased from 3.0 for harder mining
+shift_focal_gamma = 2.0  # Reduced from 5.0 to standard value to prevent hallucinations
 shift_class_weights = []  # Empty list = unweighted
 
 # Loss weights for composite model
@@ -235,7 +235,8 @@ if model_type == 'composite':
         
         # Weight: 1 (base) + minority_count * boost_factor
         # Patients with more minority events get higher sampling probability
-        patient_weights[pid] = 1.0 + minority_count * 5.0
+        # Reduced from 5.0 to 1.0 to prevent over-correction (hallucinating shifts)
+        patient_weights[pid] = 1.0 + minority_count * 1.0
     
     # Normalize to create probability distribution
     patient_weights = patient_weights / patient_weights.sum()
