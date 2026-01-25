@@ -244,7 +244,8 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
     n_pad = pad.shape[1]
 
     # Stack "no event" tokens with real tokens
-    no_event_token = 0 if apply_token_shift else 1
+    # Fix: Padding should always be 0 (Ignore Index), not 1 (Decrease)
+    no_event_token = 0
     data_tokens = torch.hstack([
         data_tokens,
         torch.full((len(ix), n_pad), no_event_token, dtype=torch.long),
