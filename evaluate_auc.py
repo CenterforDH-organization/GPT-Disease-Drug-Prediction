@@ -544,50 +544,27 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
         shift_pred = all_predictions['shift']
         shift_target = all_targets['shift']
         
-        # Get unique classes from both target and prediction (intersection to avoid warnings)
+        # Get unique classes from both target and prediction
         unique_target_classes = np.unique(shift_target)
         unique_pred_classes = np.unique(shift_pred)
-        # Use intersection to avoid warnings about classes not in y_true
-        unique_classes = np.intersect1d(unique_target_classes, unique_pred_classes)
+        
+        # Use UNION to include all classes that exist in either target or prediction
+        # This ensures we see rows/cols even for classes that were never predicted or never occurred
+        unique_classes = np.union1d(unique_target_classes, unique_pred_classes)
         unique_classes = np.sort(unique_classes)
         
-        # If no overlap, use target classes only
-        if len(unique_classes) == 0:
-            unique_classes = np.sort(unique_target_classes)
+        # Classification metrics (on all data)
+        results['shift_accuracy'] = accuracy_score(shift_target, shift_pred)
+        results['shift_balanced_accuracy'] = balanced_accuracy_score(shift_target, shift_pred)
+        results['shift_f1_macro'] = f1_score(shift_target, shift_pred, average='macro', zero_division=0)
+        results['shift_f1_micro'] = f1_score(shift_target, shift_pred, average='micro', zero_division=0)
+        results['shift_f1_weighted'] = f1_score(shift_target, shift_pred, average='weighted', zero_division=0)
+        results['shift_precision_macro'] = precision_score(shift_target, shift_pred, average='macro', zero_division=0)
+        results['shift_recall_macro'] = recall_score(shift_target, shift_pred, average='macro', zero_division=0)
+        results['shift_support'] = int(len(shift_target))
         
-        # Filter predictions and targets to only include classes that exist in both
-        # This prevents warnings about classes in y_pred not in y_true
-        valid_mask = np.isin(shift_target, unique_classes) & np.isin(shift_pred, unique_classes)
-        
-        if valid_mask.sum() > 0:
-            shift_target_filtered = shift_target[valid_mask]
-            shift_pred_filtered = shift_pred[valid_mask]
-            
-            # Classification metrics (on filtered data)
-            results['shift_accuracy'] = accuracy_score(shift_target_filtered, shift_pred_filtered)
-            results['shift_balanced_accuracy'] = balanced_accuracy_score(shift_target_filtered, shift_pred_filtered)
-            results['shift_f1_macro'] = f1_score(shift_target_filtered, shift_pred_filtered, average='macro', zero_division=0)
-            results['shift_f1_micro'] = f1_score(shift_target_filtered, shift_pred_filtered, average='micro', zero_division=0)
-            results['shift_f1_weighted'] = f1_score(shift_target_filtered, shift_pred_filtered, average='weighted', zero_division=0)
-            results['shift_precision_macro'] = precision_score(shift_target_filtered, shift_pred_filtered, average='macro', zero_division=0)
-            results['shift_recall_macro'] = recall_score(shift_target_filtered, shift_pred_filtered, average='macro', zero_division=0)
-            results['shift_support'] = int(len(shift_target_filtered))
-            
-            # Confusion matrix - use intersection classes only
-            cm = confusion_matrix(shift_target_filtered, shift_pred_filtered, labels=unique_classes)
-        else:
-            # Fallback: use all data but only classes that exist in target
-            results['shift_accuracy'] = accuracy_score(shift_target, shift_pred)
-            results['shift_balanced_accuracy'] = balanced_accuracy_score(shift_target, shift_pred)
-            results['shift_f1_macro'] = f1_score(shift_target, shift_pred, average='macro', zero_division=0)
-            results['shift_f1_micro'] = f1_score(shift_target, shift_pred, average='micro', zero_division=0)
-            results['shift_f1_weighted'] = f1_score(shift_target, shift_pred, average='weighted', zero_division=0)
-            results['shift_precision_macro'] = precision_score(shift_target, shift_pred, average='macro', zero_division=0)
-            results['shift_recall_macro'] = recall_score(shift_target, shift_pred, average='macro', zero_division=0)
-            results['shift_support'] = int(len(shift_target))
-            
-            # Use target classes only to avoid warnings
-            cm = confusion_matrix(shift_target, shift_pred, labels=unique_classes)
+        # Confusion matrix - use all unique classes found
+        cm = confusion_matrix(shift_target, shift_pred, labels=unique_classes)
         
         results['shift_confusion_matrix'] = cm.tolist()  # Convert to list for JSON serialization
         results['shift_confusion_matrix_classes'] = unique_classes.tolist()  # Store class labels
@@ -1058,7 +1035,7 @@ def evaluate_auc_pipeline(
                 cm = np.array(composite_metrics['shift_confusion_matrix'])
                 classes = composite_metrics['shift_confusion_matrix_classes']
                 print(f"\n  Confusion Matrix:")
-                print(f"    NOTE: Values shown are AFTER +1 shift (raw 0,1,2,3 → shown as 1,2,3,4)")
+                print(f"    NOTE: Values shown are RAW classes (0=Pad, 1=Dec, 2=Maint, 3=Inc)")
                 print(f"    Predicted →")
                 # Header row with mapping
                 header = "    Actual ↓   " + "  ".join([f"{int(c):>5}" for c in classes])
@@ -1066,17 +1043,14 @@ def evaluate_auc_pipeline(
                 print("    " + "-" * len(header[4:]))
                 # Data rows
                 for i, cls in enumerate(classes):
-                    # Map: shown class → raw class (subtract 1)
-                    raw_cls = int(cls) - 1
-                    row_str = f"    {int(cls):>5}({raw_cls}) " + "  ".join([f"{int(cm[i, j]):>5}" for j in range(len(classes))])
+                    row_str = f"    {int(cls):>5} " + "  ".join([f"{int(cm[i, j]):>5}" for j in range(len(classes))])
                     print(row_str)
                 
                 # Per-class metrics with mapping
                 if 'shift_per_class_metrics' in composite_metrics:
-                    print(f"\n  Per-Class Metrics (shown value = after +1 shift, raw value in parentheses):")
+                    print(f"\n  Per-Class Metrics:")
                     for cls, metrics in sorted(composite_metrics['shift_per_class_metrics'].items()):
-                        raw_cls = int(cls) - 1
-                        print(f"    Class {cls}(raw={raw_cls}): Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, "
+                        print(f"    Class {cls}: Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, "
                               f"F1={metrics['f1']:.4f}, Support={metrics['support']}")
             
             # Drug-conditioned SHIFT metrics (ONLY for drug tokens: 1279-1289)
@@ -1103,22 +1077,20 @@ def evaluate_auc_pipeline(
                     cm_drug = np.array(composite_metrics['shift_confusion_matrix_drug_cond'])
                     classes_drug = composite_metrics['shift_confusion_matrix_drug_cond_classes']
                     print(f"\n    Confusion Matrix (Drug-Conditioned, Drug Tokens Only):")
-                    print(f"      NOTE: Values shown are AFTER +1 shift (raw 0,1,2,3 → shown as 1,2,3,4)")
+                    print(f"      NOTE: Values shown are RAW classes (0=Pad, 1=Dec, 2=Maint, 3=Inc)")
                     print(f"      Predicted →")
                     header = "      Actual ↓   " + "  ".join([f"{int(c):>5}" for c in classes_drug])
                     print(header)
                     print("      " + "-" * len(header[6:]))
                     for i, cls in enumerate(classes_drug):
-                        raw_cls = int(cls) - 1
-                        row_str = f"      {int(cls):>5}({raw_cls}) " + "  ".join([f"{int(cm_drug[i, j]):>5}" for j in range(len(classes_drug))])
+                        row_str = f"      {int(cls):>5} " + "  ".join([f"{int(cm_drug[i, j]):>5}" for j in range(len(classes_drug))])
                         print(row_str)
                     
                     # Per-class metrics for drug-conditioned
                     if 'shift_per_class_metrics_drug_cond' in composite_metrics:
-                        print(f"\n    Per-Class Metrics (Drug-Conditioned, shown value = after +1 shift):")
+                        print(f"\n    Per-Class Metrics (Drug-Conditioned):")
                         for cls, metrics in sorted(composite_metrics['shift_per_class_metrics_drug_cond'].items()):
-                            raw_cls = int(cls) - 1
-                            print(f"      Class {cls}(raw={raw_cls}): Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, "
+                            print(f"      Class {cls}: Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, "
                                   f"F1={metrics['f1']:.4f}, Support={metrics['support']}")
         
         # TOTAL: regression
