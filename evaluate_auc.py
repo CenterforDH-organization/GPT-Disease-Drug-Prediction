@@ -548,10 +548,9 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
         unique_target_classes = np.unique(shift_target)
         unique_pred_classes = np.unique(shift_pred)
         
-        # Use UNION to include all classes that exist in either target or prediction
-        # This ensures we see rows/cols even for classes that were never predicted or never occurred
-        unique_classes = np.union1d(unique_target_classes, unique_pred_classes)
-        unique_classes = np.sort(unique_classes)
+        # Use FIXED classes 0,1,2,3 to ensure 4x4 matrix is always shown (including 0=Pad)
+        # This matches the user's request to see the full matrix structure
+        unique_classes = np.arange(4)  # 0, 1, 2, 3
         
         # Classification metrics (on all data)
         results['shift_accuracy'] = accuracy_score(shift_target, shift_pred)
@@ -596,8 +595,8 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
 
             shift_vocab_size = getattr(model.config, "shift_vocab_size", 5)
             shift_ignore_index = int(getattr(model.config, "shift_ignore_index", 0))
-            class_labels = np.arange(shift_vocab_size)
-            class_labels = class_labels[class_labels != shift_ignore_index]
+            # Force using classes 0, 1, 2, 3
+            class_labels = np.arange(4)
 
             results['shift_accuracy_drug_cond'] = accuracy_score(shift_target_drug, shift_pred_drug)
             results['shift_balanced_accuracy_drug_cond'] = balanced_accuracy_score(shift_target_drug, shift_pred_drug)
