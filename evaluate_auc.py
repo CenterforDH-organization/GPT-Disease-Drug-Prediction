@@ -1399,6 +1399,7 @@ def main():
                 device=device,
                 padding="random",
                 no_event_token_rate=no_event_token_rate,
+                apply_token_shift=False,  # Ensure no +1 shift, matching training config
             )
         else:
             d100k = get_batch(
