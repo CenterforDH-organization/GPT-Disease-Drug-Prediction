@@ -1438,6 +1438,23 @@ def main():
         
         if model_type == 'composite':
             df_auc_unpooled, df_auc_merged, composite_metrics = result
+            
+            # Add AUC statistics to composite_metrics if available
+            if df_auc_merged is not None and not df_auc_merged.empty and 'auc' in df_auc_merged.columns:
+                auc_values = df_auc_merged['auc'].dropna()
+                if not auc_values.empty:
+                    composite_metrics['auc_mean'] = float(auc_values.mean())
+                    composite_metrics['auc_median'] = float(auc_values.median())
+                    composite_metrics['auc_min'] = float(auc_values.min())
+                    composite_metrics['auc_max'] = float(auc_values.max())
+                    composite_metrics['auc_std'] = float(auc_values.std())
+                    composite_metrics['n_diseases_auc'] = int(len(auc_values))
+                    
+                    # Print AUC stats to console
+                    print(f"\n[AUC Statistics] (Next Disease Prediction)")
+                    print(f"  Mean:   {composite_metrics['auc_mean']:.4f}")
+                    print(f"  Median: {composite_metrics['auc_median']:.4f}")
+                    print(f"  Min/Max: {composite_metrics['auc_min']:.4f} / {composite_metrics['auc_max']:.4f}")
         else:
             df_auc_unpooled, df_auc_merged = result[:2]
             composite_metrics = None
