@@ -1,2 +1,4 @@
 .DS_Store
 *.pyc
+results/
+analyze_results.py

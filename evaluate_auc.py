@@ -453,7 +453,7 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
             shift_pred = torch.argmax(shift_logits, dim=-1)  # (B, T) - 정수 예측 (0-4)
             
             # Use per-field valid masks
-            shift_mask = (batch_y_shift != -1) & (batch_y_shift > 0)  # 0 is padding/unknown
+            shift_mask = (batch_y_shift != -1) & (batch_y_shift >= 0)  # Include 0 (Padding) as requested
             total_mask = (batch_y_total != -1) & (batch_y_total >= 0)
             
             # Drug token mask: only evaluate drug-conditioned predictions for drug tokens
