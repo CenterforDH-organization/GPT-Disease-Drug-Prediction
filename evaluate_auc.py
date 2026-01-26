@@ -453,7 +453,7 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
             shift_pred = torch.argmax(shift_logits, dim=-1)  # (B, T) - 정수 예측 (0-4)
             
             # Use per-field valid masks
-            shift_mask = (batch_y_shift != -1) & (batch_y_shift >= 0)  # Include 0 (Padding) as requested
+            shift_mask = (batch_y_shift != -1) & (batch_y_shift > 0)  # 0 is padding/unknown
             total_mask = (batch_y_total != -1) & (batch_y_total >= 0)
             
             # Drug token mask: only evaluate drug-conditioned predictions for drug tokens
@@ -548,9 +548,8 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
         unique_target_classes = np.unique(shift_target)
         unique_pred_classes = np.unique(shift_pred)
         
-        # Use FIXED classes 0,1,2,3 to ensure 4x4 matrix is always shown (including 0=Pad)
-        # This matches the user's request to see the full matrix structure
-        unique_classes = np.arange(4)  # 0, 1, 2, 3
+        # Use FIXED classes 1, 2, 3 (ignore 0=Pad)
+        unique_classes = np.array([1, 2, 3])
         
         # Classification metrics (on all data)
         results['shift_accuracy'] = accuracy_score(shift_target, shift_pred)
@@ -595,8 +594,8 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
 
             shift_vocab_size = getattr(model.config, "shift_vocab_size", 5)
             shift_ignore_index = int(getattr(model.config, "shift_ignore_index", 0))
-            # Force using classes 0, 1, 2, 3
-            class_labels = np.arange(4)
+            # Force using classes 1, 2, 3
+            class_labels = np.array([1, 2, 3])
 
             results['shift_accuracy_drug_cond'] = accuracy_score(shift_target_drug, shift_pred_drug)
             results['shift_balanced_accuracy_drug_cond'] = balanced_accuracy_score(shift_target_drug, shift_pred_drug)
@@ -1034,7 +1033,7 @@ def evaluate_auc_pipeline(
                 cm = np.array(composite_metrics['shift_confusion_matrix'])
                 classes = composite_metrics['shift_confusion_matrix_classes']
                 print(f"\n  Confusion Matrix:")
-                print(f"    NOTE: Values shown are RAW classes (0=Pad, 1=Dec, 2=Maint, 3=Inc)")
+                print(f"    NOTE: Values shown are RAW classes (1=Dec, 2=Maint, 3=Inc)")
                 print(f"    Predicted →")
                 # Header row with mapping
                 header = "    Actual ↓   " + "  ".join([f"{int(c):>5}" for c in classes])
@@ -1076,7 +1075,7 @@ def evaluate_auc_pipeline(
                     cm_drug = np.array(composite_metrics['shift_confusion_matrix_drug_cond'])
                     classes_drug = composite_metrics['shift_confusion_matrix_drug_cond_classes']
                     print(f"\n    Confusion Matrix (Drug-Conditioned, Drug Tokens Only):")
-                    print(f"      NOTE: Values shown are RAW classes (0=Pad, 1=Dec, 2=Maint, 3=Inc)")
+                    print(f"      NOTE: Values shown are RAW classes (1=Dec, 2=Maint, 3=Inc)")
                     print(f"      Predicted →")
                     header = "      Actual ↓   " + "  ".join([f"{int(c):>5}" for c in classes_drug])
                     print(header)
