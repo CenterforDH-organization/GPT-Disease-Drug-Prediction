@@ -12,10 +12,10 @@ from model import CompositeDelphi, CompositeDelphiConfig
 # =============================================================================
 # 0. Global configuration
 # =============================================================================
-CKPT_PATH = "./out-composite-large-shift/ckpt_0127.pt"
-LABELS_CHAPTER_PATH = "./data/labels_chapter.csv"
-DATA_BIN_PATH = "./data/kr_train.bin"  # 빈도를 계산할 데이터셋 경로
-OUTPUT_FILE = "umap_size_by_freq.png"
+CKPT_PATH = "ckpt.pt"
+LABELS_CHAPTER_PATH = "labels_chapter.csv"
+DATA_BIN_PATH = "data.bin"
+OUTPUT_FILE = "umap.png"
 
 START_TOKEN_ID = 23
 TARGET_LABEL_IDS = [23, 1288] # 이름 표시할 토큰
