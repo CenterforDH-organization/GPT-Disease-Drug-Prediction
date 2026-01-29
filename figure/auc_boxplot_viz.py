@@ -16,8 +16,8 @@ LABELS_CHAPTER_PATH = "labels_chapter.csv"
 DATASET_MAP = {
     "val":  ("Internal Validation", "val_df_both.csv"),
     "test": ("Internal Test", "test_df_both.csv"),
-    "jmdc": ("External Validation (JMDC)", "extval_jmdc_df_both.csv"),
-    "ukb":  ("External Validation (UKB)", "extval_ukb_df_both.csv"),
+    "ext1": ("External Validation 1", "extval_1_df_both.csv"),
+    "ext2":  ("External Validation 2", "extval_2_df_both.csv"),
 }
 
 EXCLUDE_CHAPTERS = ["Death", "XVI"]
