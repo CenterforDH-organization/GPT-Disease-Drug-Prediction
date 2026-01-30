@@ -1439,6 +1439,10 @@ def main():
         if model_type == 'composite':
             df_auc_unpooled, df_auc_merged, composite_metrics = result
             
+            # Initialize composite_metrics if None (e.g., when no drug tokens in data)
+            if composite_metrics is None:
+                composite_metrics = {}
+            
             # Add AUC statistics to composite_metrics if available
             if df_auc_merged is not None and not df_auc_merged.empty and 'auc' in df_auc_merged.columns:
                 auc_values = df_auc_merged['auc'].dropna()
@@ -1461,13 +1465,14 @@ def main():
         
         # Save results with prefix
         if output_path is not None:
-            # Save parquet files with prefix
-            df_auc_merged.to_parquet(f"{output_path}/{prefix}_df_both.parquet", index=False)
-            df_auc_unpooled.to_parquet(f"{output_path}/{prefix}_df_auc_unpooled.parquet", index=False)
+            # Save parquet files with prefix (check for None/empty DataFrames)
+            if df_auc_merged is not None and not df_auc_merged.empty:
+                df_auc_merged.to_parquet(f"{output_path}/{prefix}_df_both.parquet", index=False)
+                df_auc_merged.to_csv(f"{output_path}/{prefix}_df_both.csv", index=False)
             
-            # Also save as CSV for easy viewing
-            df_auc_merged.to_csv(f"{output_path}/{prefix}_df_both.csv", index=False)
-            df_auc_unpooled.to_csv(f"{output_path}/{prefix}_df_auc_unpooled.csv", index=False)
+            if df_auc_unpooled is not None and not df_auc_unpooled.empty:
+                df_auc_unpooled.to_parquet(f"{output_path}/{prefix}_df_auc_unpooled.parquet", index=False)
+                df_auc_unpooled.to_csv(f"{output_path}/{prefix}_df_auc_unpooled.csv", index=False)
             
             # Save composite metrics with prefix
             if composite_metrics:
