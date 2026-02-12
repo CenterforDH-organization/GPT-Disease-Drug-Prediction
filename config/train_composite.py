@@ -9,11 +9,11 @@ dataset = 'ukb_data'
 batch_size = 64
 block_size = 24
 
-# model
-n_layer = 6
-n_head = 6
-n_kv_head = 2
-n_embd = 128
+# model (scaled up for better capacity)
+n_layer = 12
+n_head = 12
+n_kv_head = 4
+n_embd = 384
 dropout = 0.2
 
 # vocabulary sizes for composite model

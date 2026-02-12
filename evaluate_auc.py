@@ -449,6 +449,11 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
             shift_logits = outputs['shift']  # (B, T, shift_vocab_size)
             total_pred = outputs['total']  # (B, T) - regression output
             
+            # Inverse log-transform if model was trained with total_log_transform
+            total_log_transform = getattr(model.config, 'total_log_transform', False)
+            if total_log_transform:
+                total_pred = torch.expm1(total_pred)  # inverse of log1p
+            
             # SHIFT: Classification (argmax)
             shift_pred = torch.argmax(shift_logits, dim=-1)  # (B, T) - 정수 예측 (0-4)
             
@@ -492,6 +497,8 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
                     if drug_total_mask.any():
                         # Apply drug_total_mask directly to outputs (before total_mask filtering)
                         tp_drug = outputs['total_drug_cond'][drug_total_mask]
+                        if total_log_transform:
+                            tp_drug = torch.expm1(tp_drug)
                         tp_drug = torch.clamp(tp_drug, min=0.0)
                         all_predictions_total_drug_cond.append(tp_drug.cpu().numpy())
                         all_targets_total_drug_cond.append(batch_y_total[drug_total_mask].float().cpu().numpy())

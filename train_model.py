@@ -42,11 +42,11 @@ block_size = 512
 model_type = 'composite'
 
 # Modern Delphi model config (3-column data)
-n_layer = 8          # Scaled up from 6
-n_head = 6
-n_kv_head = 2  # GQA (must divide n_head evenly: 6/2=3 heads per group)
-n_embd = 192         # Scaled up from 96 for better capacity
-dropout = 0.3
+n_layer = 12
+n_head = 12
+n_kv_head = 4  # GQA (must divide n_head evenly: 12/4=3 heads per group)
+n_embd = 384
+dropout = 0.2
 bias = False
 vocab_size = 1290  # Must include Death token (raw 1288 → shifted 1289)
 
@@ -77,6 +77,9 @@ sliding_window = 128
 use_drug_conditioning = True
 rope_theta = 10000.0
 
+# TOTAL regression: log-transform for skewed distribution
+total_log_transform = True
+
 # adamw optimizer
 learning_rate = 6e-4
 max_iters = 20000        # Increased from 10000
@@ -95,8 +98,7 @@ min_lr = 3e-5
 # system
 gpu_id = 0  # GPU device ID (e.g., 0, 1, 2, ...)
 device = 'cpu'  # Will be set after config parsing
-# dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'
-dtype = 'float32'  # Force float32 for MPS stability on Mac
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float32'
 compile = False  # torch.compile (requires PyTorch 2.0+)
 
 # delphi training
@@ -288,6 +290,7 @@ if model_type == 'composite':
         sliding_window=sliding_window,
         rope_theta=rope_theta,
         use_drug_conditioning=use_drug_conditioning,
+        total_log_transform=total_log_transform,
         # Composite-specific
         data_vocab_size=data_vocab_size,
         shift_vocab_size=shift_vocab_size,

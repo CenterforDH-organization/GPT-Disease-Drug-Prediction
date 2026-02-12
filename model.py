@@ -300,13 +300,28 @@ class MixtureOfExperts(nn.Module):
         
         # Route tokens to experts
         router_logits = self.gate(x)  # (B, T, num_experts)
-        routing_weights = F.softmax(router_logits, dim=-1)
+        router_probs = F.softmax(router_logits, dim=-1)
         
         # Select top-k experts
         routing_weights, selected_experts = torch.topk(
-            routing_weights, self.experts_per_token, dim=-1
+            router_probs, self.experts_per_token, dim=-1
         )
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)  # Normalize
+        
+        # ============================================================
+        # Load Balancing Auxiliary Loss (Switch Transformer style)
+        # Encourages uniform expert utilization
+        # L_aux = N * Σ(f_i * P_i)
+        #   f_i = fraction of tokens routed to expert i (hard assignment)
+        #   P_i = mean routing probability for expert i (soft assignment)
+        # ============================================================
+        with torch.no_grad():
+            # f_i: fraction of tokens dispatched to each expert
+            one_hot = F.one_hot(selected_experts, self.num_experts).float()  # (B, T, k, num_experts)
+            f = one_hot.sum(dim=(0, 1, 2)) / (B * T * self.experts_per_token)  # (num_experts,)
+        
+        P = router_probs.mean(dim=(0, 1))  # (num_experts,) - differentiable
+        aux_loss = self.num_experts * (f * P).sum()
         
         # Compute expert outputs
         final_output = torch.zeros_like(x)
@@ -334,7 +349,7 @@ class MixtureOfExperts(nn.Module):
                     weights = routing_weights[..., k:k+1]  # (B, T, 1)
                     final_output += weights * expert_output_full * token_mask.unsqueeze(-1)
         
-        return final_output
+        return final_output, aux_loss
 
 
 class ModernFFN(nn.Module):
@@ -377,8 +392,12 @@ class ModernBlock(nn.Module):
         # Pre-norm architecture (more stable)
         y, att = self.attn(self.ln_1(x), age, attn_mask)
         x = x + y
-        x = x + self.mlp(self.ln_2(x))
-        return x, att
+        mlp_out = self.mlp(self.ln_2(x))
+        aux_loss = None
+        if isinstance(mlp_out, tuple):
+            mlp_out, aux_loss = mlp_out
+        x = x + mlp_out
+        return x, att, aux_loss
 
 @dataclass
 class ModernDelphiConfig:
@@ -481,7 +500,7 @@ class ModernDelphi(nn.Module):
         # Transformer blocks
         att = []
         for block in self.transformer.h:
-            x, a = block(x, age, attn_mask)
+            x, a, _aux = block(x, age, attn_mask)
             att.append(a)
         
         x = self.transformer.ln_f(x)
@@ -569,7 +588,7 @@ class ModernDelphi(nn.Module):
         decay = set()
         no_decay = set()
         whitelist_weight_modules = (torch.nn.Linear,)
-        blacklist_weight_modules = (RMSNorm, torch.nn.Embedding)
+        blacklist_weight_modules = (RMSNorm, torch.nn.Embedding, torch.nn.LayerNorm)
         
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
@@ -702,10 +721,12 @@ class ModernDelphi(nn.Module):
 
 class CompositeEmbedding(nn.Module):
     """
-    Composite Embedding Layer: 여러 입력 필드를 각각 임베딩하고 합산
+    Composite Embedding Layer: 여러 입력 필드를 각각 임베딩하고 투영
     - DATA (약품/질병 코드) -> ID Embedding
     - SHIFT (시프트 값) -> Shift Embedding
     - TOTAL (기간) -> Duration Embedding
+    
+    Concatenation + Projection: 각 필드의 정보를 더 잘 보존
     """
     
     def __init__(self, config):
@@ -716,6 +737,9 @@ class CompositeEmbedding(nn.Module):
         self.data_emb = nn.Embedding(config.data_vocab_size, config.n_embd)
         self.shift_emb = nn.Embedding(config.shift_vocab_size, config.n_embd)
         self.total_emb = nn.Embedding(config.total_vocab_size, config.n_embd)
+        
+        # Concatenation → Projection (3*n_embd → n_embd)
+        self.proj = nn.Linear(config.n_embd * 3, config.n_embd, bias=False)
         
     def forward(self, data, shift, total):
         """
@@ -738,8 +762,9 @@ class CompositeEmbedding(nn.Module):
         total_idx = torch.clamp(total, min=0, max=self.total_emb.num_embeddings - 1)
         total_emb = self.total_emb(total_idx)
         
-        # 모든 임베딩 합산
-        combined = data_emb + shift_emb + total_emb
+        # Concatenate + Project (preserves each field's information better than sum)
+        combined = torch.cat([data_emb, shift_emb, total_emb], dim=-1)  # (B, T, 3*n_embd)
+        combined = self.proj(combined)  # (B, T, n_embd)
         
         return combined
 
@@ -779,8 +804,13 @@ class MultiHeadOutput(nn.Module):
             nn.Linear(config.n_embd, config.shift_vocab_size)
         )
         
-        # Regression Head (TOTAL) - 출력 dim = 1
-        self.total_head = nn.Linear(config.n_embd, 1, bias=True)
+        # Regression Head (TOTAL) - 2-layer MLP + LayerNorm for better regression
+        self.total_head = nn.Sequential(
+            nn.Linear(config.n_embd, config.n_embd),
+            nn.GELU(),
+            nn.LayerNorm(config.n_embd),
+            nn.Linear(config.n_embd, 1)
+        )
         
         # ============================================================
         # Drug-Conditioned Heads (FiLM style)
@@ -954,6 +984,9 @@ class CompositeDelphiConfig:
     sliding_window: int = 256
     rope_theta: float = 10000.0
     
+    # TOTAL log-transform: predict log1p(TOTAL) for better regression on skewed distribution
+    total_log_transform: bool = True
+    
     # Loss weights
     loss_weight_data: float = 1.0
     loss_weight_shift: float = 1.0
@@ -1065,9 +1098,15 @@ class CompositeDelphi(nn.Module):
         
         # 5. Transformer blocks
         att_list = []
+        aux_losses = []
         for block in self.h:
-            x, att = block(x, age, attn_mask)
+            x, att, aux_loss = block(x, age, attn_mask)
             att_list.append(att)
+            if aux_loss is not None:
+                aux_losses.append(aux_loss)
+        
+        # Average MoE load balancing loss across layers
+        moe_aux_loss = sum(aux_losses) / max(len(aux_losses), 1) if aux_losses else None
         
         x = self.ln_f(x)
         att = torch.stack(att_list) if att_list[0] is not None else None
@@ -1106,7 +1145,8 @@ class CompositeDelphi(nn.Module):
             loss = self._compute_loss(
                 logits, data, age,
                 targets_data, targets_shift, targets_total, targets_age,
-                attn_mask, validation_loss_mode
+                attn_mask, validation_loss_mode,
+                moe_aux_loss=moe_aux_loss
             )
         else:
             loss = None
@@ -1115,7 +1155,8 @@ class CompositeDelphi(nn.Module):
     
     def _compute_loss(self, logits, data, age,
                       targets_data, targets_shift, targets_total, targets_age,
-                      attn_mask, validation_loss_mode):
+                      attn_mask, validation_loss_mode,
+                      moe_aux_loss=None):
         """Compute multi-head losses"""
         device = data.device
         b, t = data.size()
@@ -1210,32 +1251,38 @@ class CompositeDelphi(nn.Module):
             # Fallback: standard TOTAL head
             total_pred = logits['total'].reshape(-1)[pass_tokens]
         
-        # Clamp predictions to valid range (raw scale 0-550)
-        total_scale = 550.0
-        total_pred = torch.clamp(total_pred, min=0.0, max=total_scale)
-        
-        # Asymmetric weighting: non-zero targets get 10x weight
-        # This prevents model from just predicting 0 for everything
-        nonzero_mask = total_target > 0
-        zero_mask = ~nonzero_mask
-        
-        # MSE Loss (larger gradients than Huber on small values)
-        mse_all = (total_pred - total_target) ** 2
-        
-        # Compute weighted loss
-        if nonzero_mask.sum() > 0 and zero_mask.sum() > 0:
-            loss_nonzero = mse_all[nonzero_mask].mean()
-            loss_zero = mse_all[zero_mask].mean()
-            # Non-zero targets are much more important (10x weight)
-            loss_total = 0.9 * loss_nonzero + 0.1 * loss_zero
-        elif nonzero_mask.sum() > 0:
-            loss_total = mse_all[nonzero_mask].mean()
+        # Log-transform: predict and compare in log1p space
+        # This handles skewed TOTAL distribution much better
+        if self.config.total_log_transform:
+            total_target_loss = torch.log1p(total_target)
+            # No clamping in log space needed, Huber loss handles outliers
+            log_scale = torch.log1p(torch.tensor(550.0, device=device))  # ~6.31
+            
+            # Huber Loss in log space (more robust than MSE for skewed data)
+            loss_total = F.huber_loss(total_pred, total_target_loss, delta=1.0)
+            
+            # Normalize to keep loss in ~[0,1] range
+            loss_total = loss_total / (log_scale ** 2)
         else:
-            loss_total = mse_all.mean()
-        
-        # Normalize by scale^2 to keep loss in reasonable range
-        # This makes loss ~1.0 instead of ~300000.0
-        loss_total = loss_total / (total_scale ** 2)
+            # Original: raw scale with MSE
+            total_scale = 550.0
+            total_pred = torch.clamp(total_pred, min=0.0, max=total_scale)
+            
+            nonzero_mask = total_target > 0
+            zero_mask = ~nonzero_mask
+            
+            mse_all = (total_pred - total_target) ** 2
+            
+            if nonzero_mask.sum() > 0 and zero_mask.sum() > 0:
+                loss_nonzero = mse_all[nonzero_mask].mean()
+                loss_zero = mse_all[zero_mask].mean()
+                loss_total = 0.9 * loss_nonzero + 0.1 * loss_zero
+            elif nonzero_mask.sum() > 0:
+                loss_total = mse_all[nonzero_mask].mean()
+            else:
+                loss_total = mse_all.mean()
+            
+            loss_total = loss_total / (total_scale ** 2)
         
         # 4. Time-to-Event Loss
         # dt = time difference (days until next event)
@@ -1322,12 +1369,19 @@ class CompositeDelphi(nn.Module):
             self.config.loss_weight_time * loss_time
         )
         
+        # MoE load balancing loss (α=0.01)
+        loss_moe = torch.tensor(0.0, device=total_loss.device)
+        if moe_aux_loss is not None:
+            loss_moe = moe_aux_loss
+            total_loss = total_loss + 0.01 * loss_moe
+        
         return {
             'loss': total_loss,
             'loss_data': loss_data,
             'loss_shift': loss_shift,
             'loss_total': loss_total,
-            'loss_time': loss_time
+            'loss_time': loss_time,
+            'loss_moe': loss_moe
         }
     
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
@@ -1335,7 +1389,7 @@ class CompositeDelphi(nn.Module):
         decay = set()
         no_decay = set()
         whitelist_weight_modules = (torch.nn.Linear,)
-        blacklist_weight_modules = (RMSNorm, torch.nn.Embedding)
+        blacklist_weight_modules = (RMSNorm, torch.nn.Embedding, torch.nn.LayerNorm)
         
         for mn, m in self.named_modules():
             for pn, p in m.named_parameters():
@@ -1460,9 +1514,15 @@ class CompositeDelphi(nn.Module):
             
             # Sample shift, total from their distributions
             shift_next = torch.argmax(shift_logits, dim=-1, keepdim=True)
+            
+            # Inverse log-transform if enabled: model predicts log1p(total), convert back
+            total_raw = total_pred
+            if self.config.total_log_transform:
+                total_raw = torch.expm1(total_pred)  # expm1 = exp(x) - 1, inverse of log1p
+            
             total_next = (
                 torch.clamp(
-                    total_pred.round(),
+                    total_raw.round(),
                     min=0,
                     max=self.config.total_vocab_size - 1,
                 )
