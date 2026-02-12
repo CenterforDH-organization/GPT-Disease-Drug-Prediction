@@ -1,6 +1,9 @@
 import sys
 from ast import literal_eval
 
+# DDP-related args injected by torchrun that should be skipped
+_ddp_skip_keys = {'local-rank', 'local_rank'}
+
 for arg in sys.argv[1:]:
     if '=' not in arg:
         # assume it's the name of a config file
@@ -11,9 +14,13 @@ for arg in sys.argv[1:]:
         exec(open(config_file).read())
     else:
         # assume it's a --key=value argument
-        assert arg.startswith('--')
-        key, val = arg.split('=')
+        if not arg.startswith('--'):
+            continue
+        key, val = arg.split('=', 1)
         key = key[2:]
+        # Skip DDP-related args (e.g. --local-rank=0 from torchrun)
+        if key in _ddp_skip_keys:
+            continue
         if key in globals():
             try:
                 # attempt to eval it (e.g. if bool, number, or etc)

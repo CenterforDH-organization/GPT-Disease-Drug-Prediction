@@ -1,9 +1,11 @@
 """
 Modern/Composite Delphi Training Script
 Supports both ModernDelphi (3-column) and CompositeDelphi (6-column) models
+Multi-GPU: Auto-detects GPUs and uses DDP (DistributedDataParallel)
 """
 
 import os
+import sys
 import time
 import math
 import pickle
@@ -11,6 +13,51 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+
+# =============================================================================
+# Auto Multi-GPU Detection & DDP Launch
+# =============================================================================
+def _auto_ddp():
+    """Auto-detect multiple GPUs and re-launch with torchrun for DDP training.
+    
+    If multiple GPUs are available and we're not already running under torchrun,
+    re-launches the script via torchrun with --nproc_per_node=<num_gpus>.
+    Skipped if user specifies --gpu_id (explicit single-GPU mode).
+    """
+    if 'RANK' in os.environ:
+        return  # Already running under torchrun/DDP
+    
+    # If user explicitly specified a single GPU, skip DDP
+    for arg in sys.argv[1:]:
+        if arg.startswith('--gpu_id='):
+            return
+    
+    n_gpus = torch.cuda.device_count()
+    if n_gpus <= 1:
+        return
+    
+    import subprocess
+    import random
+    port = random.randint(29500, 29999)
+    script = os.path.abspath(__file__)
+    
+    print(f"\n{'='*60}")
+    print(f"  Auto-detected {n_gpus} GPUs → launching DDP training")
+    for i in range(n_gpus):
+        print(f"    GPU {i}: {torch.cuda.get_device_name(i)}")
+    print(f"  Master port: {port}")
+    print(f"{'='*60}\n")
+    
+    cmd = [
+        sys.executable, '-m', 'torch.distributed.run',
+        f'--nproc_per_node={n_gpus}',
+        f'--master_port={port}',
+        script,
+    ] + sys.argv[1:]
+    
+    sys.exit(subprocess.run(cmd).returncode)
+
+_auto_ddp()
 
 from model import ModernDelphi, ModernDelphiConfig, CompositeDelphi, CompositeDelphiConfig
 from utils import get_p2i, get_batch, get_p2i_composite, get_batch_composite
@@ -124,23 +171,48 @@ exec(open('configurator.py').read())
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
-# Set device after config parsing (gpu_id can be overridden via command line)
-if torch.cuda.is_available():
-    device = f'cuda:{gpu_id}'
-    torch.cuda.set_device(gpu_id)
-    print(f"Using GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
-elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-    device = 'mps'
-    print("Using MPS (Apple Silicon)")
-else:
-    device = 'cpu'
-    print("Using CPU")
+# =============================================================================
+# DDP Setup & Device Configuration
+# =============================================================================
+ddp = int(os.environ.get('RANK', -1)) != -1
 
-tokens_per_iter = gradient_accumulation_steps * batch_size * block_size
-print(f"Tokens per iteration: {tokens_per_iter:,}")
+if ddp:
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    dist.init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(ddp_local_rank)
+    master_process = (ddp_rank == 0)
+    seed_offset = ddp_rank
+    if master_process:
+        print(f"DDP training: {ddp_world_size} GPUs")
+        for i in range(ddp_world_size):
+            print(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+else:
+    ddp_world_size = 1
+    master_process = True
+    seed_offset = 0
+    if torch.cuda.is_available():
+        device = f'cuda:{gpu_id}'
+        torch.cuda.set_device(gpu_id)
+        if master_process:
+            print(f"Using GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
+    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+        device = 'mps'
+        print("Using MPS (Apple Silicon)")
+    else:
+        device = 'cpu'
+        print("Using CPU")
+
+tokens_per_iter = gradient_accumulation_steps * batch_size * block_size * ddp_world_size
+if master_process:
+    print(f"Tokens per iteration: {tokens_per_iter:,} ({ddp_world_size} GPU(s))")
 
 os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(seed)
+torch.manual_seed(seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 device_type = 'cuda' if 'cuda' in device else ('mps' if 'mps' in device else 'cpu')
@@ -194,8 +266,9 @@ if model_type == 'composite':
     train_p2i = get_p2i_composite(train_data)
     val_p2i = get_p2i_composite(val_data)
     
-    print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
-    print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
+    if master_process:
+        print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
+        print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
 
     # Dynamic Class Weighting (SHIFT)
     # Compute weights from drug-token subset to handle class imbalance
@@ -211,13 +284,15 @@ if model_type == 'composite':
             shift_vocab_size,
             shift_ignore_index,
         )
-        print(f"Computed shift class weights (drug-token subset): {shift_class_weights}")
+        if master_process:
+            print(f"Computed shift class weights (drug-token subset): {shift_class_weights}")
 
     # ============================================================
     # WeightedRandomSampler: Patient-level balanced sampling
     # Oversample patients with minority SHIFT classes (Decrease/Increase)
     # ============================================================
-    print("Computing patient-level sampling weights for SHIFT balancing...")
+    if master_process:
+        print("Computing patient-level sampling weights for SHIFT balancing...")
     
     # Minority SHIFT classes: 1 (Decrease), 3 (Increase) in raw encoding
     # After +1 shift: 2 (Decrease), 4 (Increase)
@@ -245,8 +320,9 @@ if model_type == 'composite':
     patient_weights_tensor = torch.from_numpy(patient_weights)
     
     minority_patient_count = (patient_weights > 1.0 / len(train_p2i)).sum()
-    print(f"  Patients with minority SHIFT events: {minority_patient_count:,} / {len(train_p2i):,}")
-    print(f"  Max sampling weight: {patient_weights.max():.4f}, Min: {patient_weights.min():.6f}")
+    if master_process:
+        print(f"  Patients with minority SHIFT events: {minority_patient_count:,} / {len(train_p2i):,}")
+        print(f"  Max sampling weight: {patient_weights.max():.4f}, Min: {patient_weights.min():.6f}")
 else:
     # 3-column data: (ID, AGE, TOKEN)
     train_data = np.memmap(os.path.join(data_dir, TRAIN_DATA_PATH), dtype=np.uint32, mode='r').reshape(-1, 3)
@@ -255,13 +331,15 @@ else:
     train_p2i = get_p2i(train_data)
     val_p2i = get_p2i(val_data)
     
-    print(f"Loaded 3-column data: train={len(train_data)}, val={len(val_data)}")
-    print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
+    if master_process:
+        print(f"Loaded 3-column data: train={len(train_data)}, val={len(val_data)}")
+        print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
 
 # Downsample to requested fraction
 if data_fraction < 1.0:
     train_p2i = train_p2i[:int(data_fraction * len(train_p2i))]
-    print(f"Using {data_fraction*100:.1f}% of training data: {len(train_p2i)} patients")
+    if master_process:
+        print(f"Using {data_fraction*100:.1f}% of training data: {len(train_p2i)} patients")
 
 iter_num = 0
 best_val_loss = 1e9
@@ -309,11 +387,13 @@ if model_type == 'composite':
     )
     
     if init_from == 'scratch':
-        print("Initializing a new Composite Delphi model from scratch")
+        if master_process:
+            print("Initializing a new Composite Delphi model from scratch")
         gptconf = CompositeDelphiConfig(**model_args)
         model = CompositeDelphi(gptconf)
     elif init_from == 'resume':
-        print(f"Resuming Composite Delphi training from {out_dir}")
+        if master_process:
+            print(f"Resuming Composite Delphi training from {out_dir}")
         ckpt_path = os.path.join(out_dir, 'ckpt_composite.pt')
         checkpoint = torch.load(ckpt_path, map_location=device)
         checkpoint_model_args = checkpoint['model_args']
@@ -356,11 +436,13 @@ else:
     )
     
     if init_from == 'scratch':
-        print("Initializing a new Modern Delphi model from scratch")
+        if master_process:
+            print("Initializing a new Modern Delphi model from scratch")
         gptconf = ModernDelphiConfig(**model_args)
         model = ModernDelphi(gptconf)
     elif init_from == 'resume':
-        print(f"Resuming Modern Delphi training from {out_dir}")
+        if master_process:
+            print(f"Resuming Modern Delphi training from {out_dir}")
         ckpt_path = os.path.join(out_dir, 'ckpt.pt')
         checkpoint = torch.load(ckpt_path, map_location=device)
         checkpoint_model_args = checkpoint['model_args']
@@ -380,24 +462,33 @@ else:
 
 model.to(device)
 
-print(f"Model type: {model_type}")
-print(f"Model parameters: {model.get_num_params()/1e6:.2f}M")
+# raw_model: always points to the unwrapped model (before compile/DDP)
+# Use for state_dict, configure_optimizers, get_num_params, etc.
+raw_model = model
+
+if master_process:
+    print(f"Model type: {model_type}")
+    print(f"Model parameters: {raw_model.get_num_params()/1e6:.2f}M")
 
 # =============================================================================
 # Optimizer & Scaler
 # =============================================================================
 
 scaler = torch.amp.GradScaler('cuda', enabled=(dtype == 'float16' and device_type == 'cuda'))
-optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
+optimizer = raw_model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 
-# Compile
+# Compile (before DDP wrapping)
 if compile:
-    print("Compiling the model... (takes a ~minute)")
-    unoptimized_model = model
+    if master_process:
+        print("Compiling the model... (takes a ~minute)")
     model = torch.compile(model)
+
+# DDP wrapping (after compile)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
 
 # =============================================================================
 # Loss Estimation Functions
@@ -496,15 +587,16 @@ if wandb_log:
 # Training Loop
 # =============================================================================
 
-print(f"\n{'='*60}")
-print(f"Starting training: {model_type.upper()} Delphi")
-print(f"{'='*60}")
-print(f"  Device: {device}")
-print(f"  Batch size: {batch_size}")
-print(f"  Block size: {block_size}")
-print(f"  Max iterations: {max_iters}")
-print(f"  Learning rate: {learning_rate}")
-print(f"{'='*60}\n")
+if master_process:
+    print(f"\n{'='*60}")
+    print(f"Starting training: {model_type.upper()} Delphi")
+    print(f"{'='*60}")
+    print(f"  Device: {device} ({'DDP x' + str(ddp_world_size) if ddp else 'single'})")
+    print(f"  Batch size: {batch_size} (x{ddp_world_size} GPUs = {batch_size * ddp_world_size} effective)")
+    print(f"  Block size: {block_size}")
+    print(f"  Max iterations: {max_iters}")
+    print(f"  Learning rate: {learning_rate}")
+    print(f"{'='*60}\n")
 
 # Initial batch (weighted sampling for SHIFT class balance)
 if model_type == 'composite':
@@ -531,7 +623,7 @@ while True:
         param_group['lr'] = lr
 
     # Evaluate and checkpoint
-    # Note: All processes must call estimate_loss() to avoid DDP deadlock
+    # All processes evaluate independently; only master prints/saves
     if iter_num % eval_interval == 0 and iter_num > 0:
         losses = estimate_loss()
         
@@ -542,27 +634,28 @@ while True:
             val_loss_unpooled = 0.1 * losses['val'] + 0.9 * val_loss_unpooled
             val_loss = val_loss_unpooled[0].item()  # Total loss
             
-            train_breakdown = losses['train']
-            val_breakdown = losses['val']
-            print(f"step {iter_num}: train loss {train_breakdown[0].item():.4f}, val loss {val_breakdown[0].item():.4f} (ema {val_loss:.4f})")
-            print(
-                "  breakdown (train/val) - "
-                f"data: {train_breakdown[1].item():.4f}/{val_breakdown[1].item():.4f}, "
-                f"shift: {train_breakdown[2].item():.4f}/{val_breakdown[2].item():.4f}, "
-                f"total: {train_breakdown[3].item():.4f}/{val_breakdown[3].item():.4f}, "
-                f"time: {train_breakdown[4].item():.4f}/{val_breakdown[4].item():.4f}"
-            )
-            
-            if wandb_log:
-                wandb.log({
-                    "iter": iter_num,
-                    "train/loss": losses['train'][0].item(),
-                    "val/loss": val_loss,
-                    "val/loss_data": val_loss_unpooled[1].item(),
-                    "val/loss_shift": val_loss_unpooled[2].item(),
-                    "val/loss_total": val_loss_unpooled[3].item(),
-                    "val/loss_time": val_loss_unpooled[4].item(),
-                })
+            if master_process:
+                train_breakdown = losses['train']
+                val_breakdown = losses['val']
+                print(f"step {iter_num}: train loss {train_breakdown[0].item():.4f}, val loss {val_breakdown[0].item():.4f} (ema {val_loss:.4f})")
+                print(
+                    "  breakdown (train/val) - "
+                    f"data: {train_breakdown[1].item():.4f}/{val_breakdown[1].item():.4f}, "
+                    f"shift: {train_breakdown[2].item():.4f}/{val_breakdown[2].item():.4f}, "
+                    f"total: {train_breakdown[3].item():.4f}/{val_breakdown[3].item():.4f}, "
+                    f"time: {train_breakdown[4].item():.4f}/{val_breakdown[4].item():.4f}"
+                )
+                
+                if wandb_log:
+                    wandb.log({
+                        "iter": iter_num,
+                        "train/loss": losses['train'][0].item(),
+                        "val/loss": val_loss,
+                        "val/loss_data": val_loss_unpooled[1].item(),
+                        "val/loss_shift": val_loss_unpooled[2].item(),
+                        "val/loss_total": val_loss_unpooled[3].item(),
+                        "val/loss_time": val_loss_unpooled[4].item(),
+                    })
         else:
             # Modern model has 2 loss components (ce, dt)
             if val_loss is None:
@@ -570,23 +663,24 @@ while True:
             val_loss_unpooled = 0.1 * losses['val'] + 0.9 * val_loss_unpooled
             val_loss = val_loss_unpooled.sum().item()
             
-            print(f"step {iter_num}: train loss {losses['train'].sum().item():.4f}, val loss {losses['val'].sum().item():.4f} ({val_loss:.4f})")
-            
-            if wandb_log:
-                wandb.log({
-                    "iter": iter_num,
-                    "train/agg_loss": losses['train'].sum().item(),
-                    "val/loss": val_loss,
-                    "val/loss_ce": val_loss_unpooled[0].item(),
-                    "val/loss_dt": val_loss_unpooled[1].item(),
-                })
+            if master_process:
+                print(f"step {iter_num}: train loss {losses['train'].sum().item():.4f}, val loss {losses['val'].sum().item():.4f} ({val_loss:.4f})")
+                
+                if wandb_log:
+                    wandb.log({
+                        "iter": iter_num,
+                        "train/agg_loss": losses['train'].sum().item(),
+                        "val/loss": val_loss,
+                        "val/loss_ce": val_loss_unpooled[0].item(),
+                        "val/loss_dt": val_loss_unpooled[1].item(),
+                    })
 
-        # Save best checkpoint
-        if always_save_checkpoint or val_loss < best_val_loss:
+        # Save best checkpoint (master only)
+        if master_process and (always_save_checkpoint or val_loss < best_val_loss):
             best_val_loss = val_loss
             if iter_num > 0:
                 checkpoint = {
-                    'model': model.state_dict(),
+                    'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'model_args': model_args,
                     'iter_num': iter_num,
@@ -597,10 +691,10 @@ while True:
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
 
-        # Save periodic checkpoint
-        if iter_num % 10_000 == 0:
+        # Save periodic checkpoint (master only)
+        if master_process and iter_num % 10_000 == 0:
             checkpoint = {
-                'model': model.state_dict(),
+                'model': raw_model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'model_args': model_args,
                 'iter_num': iter_num,
@@ -616,6 +710,10 @@ while True:
 
     # Training step
     for micro_step in range(gradient_accumulation_steps):
+        # DDP: only sync gradients on the last micro-step (performance optimization)
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        
         if model_type == 'composite':
             with ctx:
                 logits, loss, att = model(
@@ -653,10 +751,10 @@ while True:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-    # Gradient monitoring for debugging (every 1000 iters)
-    if iter_num % 1000 == 0 and model_type == 'composite':
+    # Gradient monitoring for debugging (every 1000 iters, master only)
+    if master_process and iter_num % 1000 == 0 and model_type == 'composite':
         grad_info = []
-        for name, param in model.named_parameters():
+        for name, param in raw_model.named_parameters():
             if param.grad is not None:
                 if 'total_head' in name or 'time_head' in name or 'time_shape_head' in name:
                     grad_norm = param.grad.norm().item()
@@ -674,7 +772,7 @@ while True:
     dt = t1 - t0
     t0 = t1
     
-    if iter_num % log_interval == 0:
+    if master_process and iter_num % log_interval == 0:
         lossf = total_loss.item()
         # Show lr trend
         if iter_num > 0 and iter_num % (log_interval * 10) == 0:
@@ -706,8 +804,13 @@ while True:
     if iter_num > max_iters:
         break
 
-print(f"\n{'='*60}")
-print(f"Training completed!")
-print(f"Best validation loss: {best_val_loss:.4f}")
-print(f"Total iterations: {iter_num}")
-print(f"{'='*60}")
+if master_process:
+    print(f"\n{'='*60}")
+    print(f"Training completed!")
+    print(f"Best validation loss: {best_val_loss:.4f}")
+    print(f"Total iterations: {iter_num}")
+    print(f"{'='*60}")
+
+# DDP cleanup
+if ddp:
+    dist.destroy_process_group()
