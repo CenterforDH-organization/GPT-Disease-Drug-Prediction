@@ -487,8 +487,10 @@ if compile:
     model = torch.compile(model)
 
 # DDP wrapping (after compile)
+# find_unused_parameters=True: needed because drug-conditioned heads and MoE experts
+# may not participate in every forward pass (conditional activation)
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    model = DDP(model, device_ids=[ddp_local_rank], find_unused_parameters=True)
 
 # =============================================================================
 # Loss Estimation Functions

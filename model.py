@@ -1097,11 +1097,14 @@ class CompositeDelphi(nn.Module):
         attn_mask *= torch.tril(torch.ones(t, t, device=device))[None, None, :, :] > 0
         
         # 5. Transformer blocks
+        # Skip attention weight collection during training to save ~13GB+ GPU memory
+        is_training = targets_data is not None
         att_list = []
         aux_losses = []
         for block in self.h:
             x, att, aux_loss = block(x, age, attn_mask)
-            att_list.append(att)
+            if not is_training:
+                att_list.append(att)
             if aux_loss is not None:
                 aux_losses.append(aux_loss)
         
@@ -1109,7 +1112,7 @@ class CompositeDelphi(nn.Module):
         moe_aux_loss = sum(aux_losses) / max(len(aux_losses), 1) if aux_losses else None
         
         x = self.ln_f(x)
-        att = torch.stack(att_list) if att_list[0] is not None else None
+        att = torch.stack(att_list) if (att_list and att_list[0] is not None) else None
         
         # 6. Multi-Head Output
         # Drug-Conditioning: FiLM modulation for SHIFT/TOTAL prediction
