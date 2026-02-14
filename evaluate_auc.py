@@ -1220,7 +1220,12 @@ def main():
         model = ModernDelphi(conf)
     
     state_dict = checkpoint["model"]
-    model.load_state_dict(state_dict)
+    # Strip DDP 'module.' or torch.compile '_orig_mod.' prefixes if present
+    cleaned = {}
+    for k, v in state_dict.items():
+        k = k.replace('module.', '').replace('_orig_mod.', '')
+        cleaned[k] = v
+    model.load_state_dict(cleaned)
     model.eval()
     model = model.to(device)
     
