@@ -270,11 +270,13 @@ if model_type == 'composite':
         print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
         print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
 
+    # Drug token range (used by both class-weighting and patient sampling)
+    drug_token_min = 1279 if apply_token_shift else 1278
+    drug_token_max = 1289 if apply_token_shift else 1288
+
     # Dynamic Class Weighting (SHIFT)
     # Compute weights from drug-token subset to handle class imbalance
     if not shift_class_weights:
-        drug_token_min = 1279 if apply_token_shift else 1278
-        drug_token_max = 1289 if apply_token_shift else 1288
         drug_mask = (train_data['DATA'] >= drug_token_min) & (train_data['DATA'] <= drug_token_max)
         shift_values = train_data['SHIFT'][drug_mask].astype(np.int64)
         if apply_token_shift:
