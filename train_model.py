@@ -9,6 +9,7 @@ import sys
 import time
 import math
 import pickle
+import json
 from contextlib import nullcontext
 
 import numpy as np
@@ -79,6 +80,12 @@ seed = 42
 wandb_log = False
 wandb_project = 'modern-delphi'
 wandb_run_name = 'run' + str(time.time())
+
+# training artifact logging
+save_loss_history = True
+save_loss_plot = True
+loss_history_filename = 'training_loss_history.json'
+loss_plot_filename = 'training_loss_plot.png'
 
 # data
 gradient_accumulation_steps = 1
@@ -784,6 +791,86 @@ if wandb_log:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+train_loss_history = []
+val_loss_history = []
+
+
+def _to_float(v):
+    if torch.is_tensor(v):
+        return float(v.detach().item())
+    return float(v)
+
+
+def _maybe_save_loss_artifacts():
+    if not master_process or not save_loss_history:
+        return
+
+    payload = {
+        'model_type': model_type,
+        'train': train_loss_history,
+        'val': val_loss_history,
+        'config': {
+            'log_interval': log_interval,
+            'eval_interval': eval_interval,
+            'max_iters': max_iters,
+        }
+    }
+    history_path = os.path.join(out_dir, loss_history_filename)
+    with open(history_path, 'w') as f:
+        json.dump(payload, f, indent=2)
+    print(f"Saved loss history: {history_path}")
+
+    if not save_loss_plot:
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"Skipping loss plot (matplotlib unavailable): {e}")
+        return
+
+    if len(train_loss_history) == 0 and len(val_loss_history) == 0:
+        print("Skipping loss plot (no history points).")
+        return
+
+    nrows = 2 if model_type == 'composite' else 1
+    fig, axes = plt.subplots(nrows, 1, figsize=(10, 8 if nrows == 2 else 5), sharex=True)
+    if nrows == 1:
+        axes = [axes]
+
+    train_x = [p['iter'] for p in train_loss_history]
+    train_y = [p['loss'] for p in train_loss_history]
+    val_x = [p['iter'] for p in val_loss_history]
+    val_y = [p['loss'] for p in val_loss_history]
+
+    axes[0].plot(train_x, train_y, label='train/loss', linewidth=1.3)
+    if len(val_x) > 0:
+        axes[0].plot(val_x, val_y, label='val/loss', linewidth=1.8)
+    axes[0].set_title('Training vs Validation Loss')
+    axes[0].set_ylabel('Loss')
+    axes[0].grid(alpha=0.3)
+    axes[0].legend()
+
+    if model_type == 'composite':
+        comp_keys = ['loss_data', 'loss_shift', 'loss_total', 'loss_time']
+        for k in comp_keys:
+            xs = [p['iter'] for p in val_loss_history if k in p]
+            ys = [p[k] for p in val_loss_history if k in p]
+            if len(xs) > 0:
+                axes[1].plot(xs, ys, label=f'val/{k}', linewidth=1.3)
+        axes[1].set_title('Validation Loss Components')
+        axes[1].set_ylabel('Loss')
+        axes[1].grid(alpha=0.3)
+        axes[1].legend()
+
+    axes[-1].set_xlabel('Iteration')
+    fig.tight_layout()
+
+    plot_path = os.path.join(out_dir, loss_plot_filename)
+    fig.savefig(plot_path, dpi=180, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Saved loss plot: {plot_path}")
+
 
 def _sample_patient_indices(p2i, weights_tensor):
     if weights_tensor is not None:
@@ -905,6 +992,14 @@ while True:
                         "val/loss_total": val_loss_unpooled[3].item(),
                         "val/loss_time": val_loss_unpooled[4].item(),
                     })
+                val_loss_history.append({
+                    'iter': int(iter_num),
+                    'loss': _to_float(val_loss),
+                    'loss_data': _to_float(val_loss_unpooled[1]),
+                    'loss_shift': _to_float(val_loss_unpooled[2]),
+                    'loss_total': _to_float(val_loss_unpooled[3]),
+                    'loss_time': _to_float(val_loss_unpooled[4]),
+                })
         else:
             # Modern model has 2 loss components (ce, dt)
             if val_loss is None:
@@ -923,6 +1018,12 @@ while True:
                         "val/loss_ce": val_loss_unpooled[0].item(),
                         "val/loss_dt": val_loss_unpooled[1].item(),
                     })
+                val_loss_history.append({
+                    'iter': int(iter_num),
+                    'loss': _to_float(val_loss),
+                    'loss_ce': _to_float(val_loss_unpooled[0]),
+                    'loss_dt': _to_float(val_loss_unpooled[1]),
+                })
 
         # Save best checkpoint (master only)
         if master_process and (always_save_checkpoint or val_loss < best_val_loss):
@@ -1045,6 +1146,22 @@ while True:
                 })
             wandb.log(log_dict)
 
+        point = {
+            'iter': int(iter_num),
+            'loss': _to_float(total_loss),
+            'lr': _to_float(lr),
+            'time_ms': _to_float(dt * 1000.0),
+            'batch_source': batch_source,
+        }
+        if model_type == 'composite':
+            point.update({
+                'loss_data': _to_float(loss['loss_data']),
+                'loss_shift': _to_float(loss['loss_shift']),
+                'loss_total': _to_float(loss['loss_total']),
+                'loss_time': _to_float(loss['loss_time']),
+            })
+        train_loss_history.append(point)
+
     iter_num += 1
     local_iter_num += 1
 
@@ -1053,6 +1170,7 @@ while True:
         break
 
 if master_process:
+    _maybe_save_loss_artifacts()
     print(f"\n{'='*60}")
     print(f"Training completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")
