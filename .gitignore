@@ -2,4 +2,6 @@
 *.pyc
 **/*.png
 results/
-analyze_results.py
+analyze_results.py.ipynb_checkpoints/
+figure/.ipynb_checkpoints
+figure/figutils/.ipynb_checkpoints
