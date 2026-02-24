@@ -788,7 +788,6 @@ class MultiHeadOutput(nn.Module):
         super().__init__()
         self.n_embd = config.n_embd
         self.time_distribution = getattr(config, 'time_distribution', 'exponential')
-        self.total_loss_mode = str(getattr(config, 'total_loss_mode', 'log_huber')).lower()
         
         # Drug-conditioning option
         self.use_drug_conditioning = getattr(config, 'use_drug_conditioning', False)
@@ -812,14 +811,6 @@ class MultiHeadOutput(nn.Module):
             nn.LayerNorm(config.n_embd),
             nn.Linear(config.n_embd, 1)
         )
-
-        # TOTAL two-stage mode: 0 여부를 별도 binary head로 분리
-        if self.total_loss_mode == 'two_stage':
-            self.total_nonzero_head = nn.Sequential(
-                nn.Linear(config.n_embd, config.n_embd // 2),
-                nn.GELU(),
-                nn.Linear(config.n_embd // 2, 1)
-            )
         
         # ============================================================
         # Drug-Conditioned Heads (FiLM style)
@@ -887,9 +878,6 @@ class MultiHeadOutput(nn.Module):
             'total': self.total_head(x).squeeze(-1), # (B, T) - regression value
             'time_scale': self.time_head(x),         # (B, T, data_vocab_size) - λ parameter
         }
-
-        if self.total_loss_mode == 'two_stage':
-            output['total_nonzero'] = self.total_nonzero_head(x).squeeze(-1)  # (B, T) binary logits
         
         # ============================================================
         # Drug-Conditioned Predictions (FiLM modulation)
@@ -998,15 +986,6 @@ class CompositeDelphiConfig:
     
     # TOTAL log-transform: predict log1p(TOTAL) for better regression on skewed distribution
     total_log_transform: bool = True
-    # TOTAL loss mode:
-    # - log_huber: log1p(TOTAL) + Huber (기본)
-    # - raw_mse: raw TOTAL + weighted MSE
-    # - two_stage: 0/non-zero BCE + positive-only regression
-    total_loss_mode: str = 'log_huber'
-    total_huber_delta: float = 1.0
-    total_two_stage_cls_weight: float = 1.0
-    total_two_stage_reg_weight: float = 1.0
-    total_two_stage_use_log: bool = True
     
     # Loss weights
     loss_weight_data: float = 1.0
@@ -1259,7 +1238,9 @@ class CompositeDelphi(nn.Module):
                     ignore_index=-1,
                 )
         
-        # 3. TOTAL Regression Loss
+        # 3. TOTAL Regression Loss (redesigned for better gradient flow)
+        # Problem: normalized 0-1 scale produced tiny gradients (~0.0002)
+        # Solution: Use raw scale (0-550) with MSE loss and asymmetric weighting
         targets_total_float = targets_total.float()
         total_target = targets_total_float.reshape(-1)[pass_tokens]  # (N,) target, raw scale
         
@@ -1273,70 +1254,38 @@ class CompositeDelphi(nn.Module):
             # Fallback: standard TOTAL head
             total_pred = logits['total'].reshape(-1)[pass_tokens]
         
-        total_loss_mode = str(getattr(self.config, 'total_loss_mode', 'log_huber')).lower()
-        huber_delta = float(getattr(self.config, 'total_huber_delta', 1.0))
-
-        loss_total_cls = torch.tensor(0.0, device=device)
-        loss_total_reg = torch.tensor(0.0, device=device)
-
-        if total_loss_mode == 'two_stage':
-            # Stage 1) 0 / non-zero classification
-            nonzero_target = (total_target > 0).float()
-            if 'total_nonzero' in logits:
-                total_nonzero_logits = logits['total_nonzero'].reshape(-1)[pass_tokens]
-            else:
-                # Backward compatibility: fallback if head is absent
-                total_nonzero_logits = total_pred
-            loss_total_cls = F.binary_cross_entropy_with_logits(
-                total_nonzero_logits,
-                nonzero_target
-            )
-
-            # Stage 2) positive-only regression
-            pos_mask = nonzero_target > 0.5
-            if pos_mask.any():
-                if bool(getattr(self.config, 'total_two_stage_use_log', True)):
-                    target_pos = torch.log1p(total_target[pos_mask])
-                    pred_pos = total_pred[pos_mask]
-                    log_scale = torch.log1p(torch.tensor(550.0, device=device))
-                    loss_total_reg = F.huber_loss(pred_pos, target_pos, delta=huber_delta)
-                    loss_total_reg = loss_total_reg / (log_scale ** 2)
-                else:
-                    total_scale = 550.0
-                    target_pos = total_target[pos_mask]
-                    pred_pos = torch.clamp(total_pred[pos_mask], min=0.0, max=total_scale)
-                    loss_total_reg = F.huber_loss(pred_pos, target_pos, delta=huber_delta)
-                    loss_total_reg = loss_total_reg / (total_scale ** 2)
-
-            cls_w = float(getattr(self.config, 'total_two_stage_cls_weight', 1.0))
-            reg_w = float(getattr(self.config, 'total_two_stage_reg_weight', 1.0))
-            loss_total = cls_w * loss_total_cls + reg_w * loss_total_reg
-
-        elif total_loss_mode == 'raw_mse':
+        # Log-transform: predict and compare in log1p space
+        # This handles skewed TOTAL distribution much better
+        if self.config.total_log_transform:
+            total_target_loss = torch.log1p(total_target)
+            # No clamping in log space needed, Huber loss handles outliers
+            log_scale = torch.log1p(torch.tensor(550.0, device=device))  # ~6.31
+            
+            # Huber Loss in log space (more robust than MSE for skewed data)
+            loss_total = F.huber_loss(total_pred, total_target_loss, delta=1.0)
+            
+            # Normalize to keep loss in ~[0,1] range
+            loss_total = loss_total / (log_scale ** 2)
+        else:
+            # Original: raw scale with MSE
             total_scale = 550.0
             total_pred = torch.clamp(total_pred, min=0.0, max=total_scale)
-
+            
             nonzero_mask = total_target > 0
             zero_mask = ~nonzero_mask
+            
             mse_all = (total_pred - total_target) ** 2
-
+            
             if nonzero_mask.sum() > 0 and zero_mask.sum() > 0:
                 loss_nonzero = mse_all[nonzero_mask].mean()
                 loss_zero = mse_all[zero_mask].mean()
-                loss_total_reg = 0.9 * loss_nonzero + 0.1 * loss_zero
+                loss_total = 0.9 * loss_nonzero + 0.1 * loss_zero
             elif nonzero_mask.sum() > 0:
-                loss_total_reg = mse_all[nonzero_mask].mean()
+                loss_total = mse_all[nonzero_mask].mean()
             else:
-                loss_total_reg = mse_all.mean()
-
-            loss_total = loss_total_reg / (total_scale ** 2)
-
-        else:
-            # default: log-huber
-            total_target_loss = torch.log1p(total_target)
-            log_scale = torch.log1p(torch.tensor(550.0, device=device))  # ~6.31
-            loss_total_reg = F.huber_loss(total_pred, total_target_loss, delta=huber_delta)
-            loss_total = loss_total_reg / (log_scale ** 2)
+                loss_total = mse_all.mean()
+            
+            loss_total = loss_total / (total_scale ** 2)
         
         # 4. Time-to-Event Loss
         # dt = time difference (days until next event)
@@ -1434,8 +1383,6 @@ class CompositeDelphi(nn.Module):
             'loss_data': loss_data,
             'loss_shift': loss_shift,
             'loss_total': loss_total,
-            'loss_total_cls': loss_total_cls,
-            'loss_total_reg': loss_total_reg,
             'loss_time': loss_time,
             'loss_moe': loss_moe
         }

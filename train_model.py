@@ -9,7 +9,6 @@ import sys
 import time
 import math
 import pickle
-import json
 from contextlib import nullcontext
 
 import numpy as np
@@ -81,12 +80,6 @@ wandb_log = False
 wandb_project = 'modern-delphi'
 wandb_run_name = 'run' + str(time.time())
 
-# training artifact logging
-save_loss_history = True
-save_loss_plot = True
-loss_history_filename = 'training_loss_history.json'
-loss_plot_filename = 'training_loss_plot.png'
-
 # data
 gradient_accumulation_steps = 1
 batch_size = 96
@@ -112,19 +105,8 @@ total_vocab_size = 552   # TOTAL: Embedding vocab
 # SHIFT imbalance handling
 shift_loss_type = 'focal'           # 'ce' or 'focal'
 shift_ignore_index = 0
-shift_focal_gamma = 2.0
-shift_class_weights = []  # Non-empty list = manual class weights
-shift_auto_class_weight_mode = 'inverse'  # 'none', 'inverse', 'sqrt_inverse'
-shift_class_weights_from_drug_tokens_only = True
-shift_class_weight_min = 0.0
-shift_class_weight_max = 50.0
-
-# SHIFT patient sampling for class balancing
-shift_sampling_strategy = 'weighted'  # 'uniform' or 'weighted'
-shift_sampling_boost_factor = 1.0
-shift_sampling_minority_classes = [1, 3]  # raw SHIFT ids by default
-shift_sampling_classes_are_shifted = False
-shift_sampling_drug_only = True
+shift_focal_gamma = 2.0  # Reduced from 5.0 to standard value to prevent hallucinations
+shift_class_weights = []  # Empty list = unweighted
 
 # Loss weights for composite model
 loss_weight_data = 1.0
@@ -142,16 +124,8 @@ sliding_window = 128
 use_drug_conditioning = True
 rope_theta = 10000.0
 
-# TOTAL regression modes:
-# - total_loss_mode='log_huber': log1p(TOTAL)+Huber (recommended baseline)
-# - total_loss_mode='two_stage': non-zero BCE + positive-only regression
-# - total_loss_mode='raw_mse': raw-scale weighted MSE
+# TOTAL regression: log-transform for skewed distribution
 total_log_transform = True
-total_loss_mode = 'log_huber'
-total_huber_delta = 1.0
-total_two_stage_cls_weight = 1.0
-total_two_stage_reg_weight = 1.0
-total_two_stage_use_log = True
 
 # adamw optimizer
 learning_rate = 6e-4
@@ -188,31 +162,14 @@ time_distribution = 'exponential'
 
 TRAIN_DATA_PATH = '../data/kr_train.bin'
 VAL_DATA_PATH = '../data/kr_val.bin'
-
-# Optional domain adaptation for UKB generalization
-domain_adaptation_enabled = False
-domain_adapt_mode = 'mix'  # 'mix' or 'finetune'
-domain_adapt_data_path = '../data/UKB_extval.bin'
-domain_adapt_patient_fraction = 0.1
-domain_adapt_mix_ratio = 0.3
-domain_adapt_start_iter = 0
-domain_adapt_lr_scale = 0.1
-domain_adapt_sampling_strategy = 'uniform'  # 'uniform' or 'weighted'
-domain_adapt_seed = 42
+# JMDC path for domain generalization (mixing)
+JMDC_DATA_PATH = '../data/JMDC_extval.bin'
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]
 exec(open('configurator.py').read())
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
-
-# Keep TOTAL prediction space consistent with selected loss mode.
-_total_loss_mode = str(total_loss_mode).lower()
-if _total_loss_mode == 'raw_mse':
-    total_log_transform = False
-elif _total_loss_mode == 'two_stage':
-    total_log_transform = bool(total_two_stage_use_log)
-config['total_log_transform'] = total_log_transform
 
 # =============================================================================
 # DDP Setup & Device Configuration
@@ -271,118 +228,27 @@ torch.set_default_dtype(ptdtype)
 
 # data_dir = '../data'
 
-
-def _compute_shift_class_weights(
-    shift_values,
-    shift_vocab_size,
-    shift_ignore_index,
-    mode='inverse',
-    min_weight=0.0,
-    max_weight=50.0,
-):
-    mode = str(mode).lower()
-    if mode == 'none':
-        return []
-    if mode not in {'inverse', 'sqrt_inverse'}:
-        raise ValueError(f"Unknown shift_auto_class_weight_mode: {mode}")
-
+def _compute_shift_class_weights(shift_values, shift_vocab_size, shift_ignore_index):
     counts = np.bincount(shift_values, minlength=shift_vocab_size).astype(np.float64)
     if shift_ignore_index is not None and 0 <= shift_ignore_index < shift_vocab_size:
         counts[shift_ignore_index] = 0.0
-
     nonzero = counts > 0
     weights = np.zeros(shift_vocab_size, dtype=np.float32)
-    if not nonzero.any():
-        return weights.tolist()
-
-    mean_count = counts[nonzero].mean()
-    raw = mean_count / counts[nonzero]
-    if mode == 'sqrt_inverse':
-        raw = np.sqrt(raw)
-
-    raw = np.clip(raw, min_weight, max_weight)
-    # Normalize to mean 1.0 for stable loss scale
-    raw = raw / max(raw.mean(), 1e-8)
-    weights[nonzero] = raw.astype(np.float32)
+    if nonzero.any():
+        weights[nonzero] = counts[nonzero].sum() / (counts[nonzero] * nonzero.sum())
     return weights.tolist()
 
-
-def _resolve_minority_classes(raw_classes, apply_shift, classes_are_shifted):
-    classes = [int(c) for c in raw_classes]
-    if apply_shift and not classes_are_shifted:
-        classes = [c + 1 for c in classes]
-    elif (not apply_shift) and classes_are_shifted:
-        classes = [max(0, c - 1) for c in classes]
-    return classes
-
-
-def _subset_patients(p2i, fraction, seed):
-    if fraction >= 1.0:
-        return p2i
-    n_patients = len(p2i)
-    if n_patients == 0:
-        return p2i
-    n_keep = max(1, int(n_patients * fraction))
-    rng = np.random.default_rng(seed)
-    keep_idx = np.sort(rng.choice(n_patients, size=n_keep, replace=False))
-    return p2i[keep_idx]
-
-
-def _compute_patient_sampling_weights(
-    data,
-    p2i,
-    minority_classes,
-    boost_factor,
-    drug_only,
-    drug_token_min,
-    drug_token_max,
-    apply_shift,
-):
-    if len(p2i) == 0:
-        return np.array([], dtype=np.float32), 0
-
-    weights = np.ones(len(p2i), dtype=np.float32)
-    minority_patient_count = 0
-    for pid, (start_idx, length) in enumerate(p2i):
-        patient_data = data[start_idx:start_idx + length]
-
-        if drug_only:
-            drug_mask = (
-                (patient_data['DATA'] >= drug_token_min) &
-                (patient_data['DATA'] <= drug_token_max)
-            )
-            patient_shifts = patient_data['SHIFT'][drug_mask]
-        else:
-            patient_shifts = patient_data['SHIFT']
-
-        if apply_shift:
-            patient_shifts = patient_shifts + 1
-
-        minority_count = 0
-        for cls in minority_classes:
-            minority_count += int((patient_shifts == cls).sum())
-
-        if minority_count > 0:
-            minority_patient_count += 1
-
-        weights[pid] = 1.0 + float(boost_factor) * minority_count
-
-    weights = weights / weights.sum()
-    return weights, minority_patient_count
-
-
-def _weights_to_tensor(weights):
-    if weights is None:
-        return None
-    if len(weights) == 0:
-        return None
-    return torch.from_numpy(weights.astype(np.float32))
-
-domain_train_data = None
-domain_train_p2i = None
-domain_patient_weights_tensor = None
-
 if model_type == 'composite':
+    # 6-column structured data: (ID, AGE, DATA, DOSE, TOTAL, UNIT)
+    # composite_dtype = np.dtype([
+    #     ('ID', '<u4'),
+    #     ('AGE', '<u4'),
+    #     ('DATA', '<u4'),
+    #     ('DOSE', '<f4'),
+    #     ('TOTAL', '<u4'),
+    #     ('UNIT', '<u4')
+    # ])
+
     composite_dtype = np.dtype([
         ('ID', np.uint32),
         ('AGE', np.uint32),
@@ -391,145 +257,87 @@ if model_type == 'composite':
         ('TOTAL', np.uint32)
     ])
 
+    # train_data = np.memmap(TRAIN_DATA_PATH, dtype=composite_dtype, mode='r')
+    # val_data = np.memmap(VAL_DATA_PATH, dtype=composite_dtype, mode='r')
+
     train_data = np.fromfile(TRAIN_DATA_PATH, dtype=composite_dtype)
     val_data = np.fromfile(VAL_DATA_PATH, dtype=composite_dtype)
-
+    
     train_p2i = get_p2i_composite(train_data)
     val_p2i = get_p2i_composite(val_data)
-
+    
     if master_process:
         print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
         print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
 
-    # Drug token range in DATA field
-    drug_token_min = 1279 if apply_token_shift else 1278
-    drug_token_max = 1289 if apply_token_shift else 1288
-
-    # SHIFT class weights (manual > auto)
-    if shift_class_weights:
-        if master_process:
-            print(f"Using user-provided SHIFT class weights: {shift_class_weights}")
-    else:
-        class_weight_mode = str(shift_auto_class_weight_mode).lower()
-        if class_weight_mode != 'none':
-            if shift_class_weights_from_drug_tokens_only:
-                shift_mask = (train_data['DATA'] >= drug_token_min) & (train_data['DATA'] <= drug_token_max)
-                shift_values = train_data['SHIFT'][shift_mask].astype(np.int64)
-            else:
-                shift_values = train_data['SHIFT'].astype(np.int64)
-            if apply_token_shift:
-                shift_values = shift_values + 1
-
-            if shift_values.size > 0:
-                shift_class_weights = _compute_shift_class_weights(
-                    shift_values=shift_values,
-                    shift_vocab_size=shift_vocab_size,
-                    shift_ignore_index=shift_ignore_index,
-                    mode=class_weight_mode,
-                    min_weight=float(shift_class_weight_min),
-                    max_weight=float(shift_class_weight_max),
-                )
-            if master_process:
-                print(f"Computed SHIFT class weights ({class_weight_mode}): {shift_class_weights}")
-
-    # SHIFT patient sampling
-    shift_sampling_strategy = str(shift_sampling_strategy).lower()
-    minority_classes = _resolve_minority_classes(
-        shift_sampling_minority_classes,
-        apply_shift=apply_token_shift,
-        classes_are_shifted=bool(shift_sampling_classes_are_shifted),
-    )
-
-    patient_weights_tensor = None
-    if shift_sampling_strategy == 'weighted':
-        if master_process:
-            print("Computing patient-level sampling weights for SHIFT balancing...")
-        patient_weights, minority_patient_count = _compute_patient_sampling_weights(
-            data=train_data,
-            p2i=train_p2i,
-            minority_classes=minority_classes,
-            boost_factor=float(shift_sampling_boost_factor),
-            drug_only=bool(shift_sampling_drug_only),
-            drug_token_min=drug_token_min,
-            drug_token_max=drug_token_max,
-            apply_shift=bool(apply_token_shift),
+    # Dynamic Class Weighting (SHIFT)
+    # Compute weights from drug-token subset to handle class imbalance
+    if not shift_class_weights:
+        drug_token_min = 1279 if apply_token_shift else 1278
+        drug_token_max = 1289 if apply_token_shift else 1288
+        drug_mask = (train_data['DATA'] >= drug_token_min) & (train_data['DATA'] <= drug_token_max)
+        shift_values = train_data['SHIFT'][drug_mask].astype(np.int64)
+        if apply_token_shift:
+            shift_values = shift_values + 1
+        shift_class_weights = _compute_shift_class_weights(
+            shift_values,
+            shift_vocab_size,
+            shift_ignore_index,
         )
-        patient_weights_tensor = _weights_to_tensor(patient_weights)
         if master_process:
-            print(f"  Patients with minority SHIFT events: {minority_patient_count:,} / {len(train_p2i):,}")
-            print(f"  Max sampling weight: {patient_weights.max():.4f}, Min: {patient_weights.min():.6f}")
-    elif shift_sampling_strategy != 'uniform':
-        raise ValueError(f"Unknown shift_sampling_strategy: {shift_sampling_strategy}")
+            print(f"Computed shift class weights (drug-token subset): {shift_class_weights}")
 
-    # Optional UKB domain adaptation data
-    domain_mode = str(domain_adapt_mode).lower()
-    if domain_adaptation_enabled:
-        if domain_mode not in {'mix', 'finetune'}:
-            raise ValueError(f"Unknown domain_adapt_mode: {domain_adapt_mode}")
-        if domain_mode == 'mix' and not (0.0 <= domain_adapt_mix_ratio <= 1.0):
-            raise ValueError(f"domain_adapt_mix_ratio must be in [0,1], got {domain_adapt_mix_ratio}")
-        if not os.path.exists(domain_adapt_data_path):
-            raise FileNotFoundError(f"Domain adaptation data not found: {domain_adapt_data_path}")
-
-        domain_train_data = np.fromfile(domain_adapt_data_path, dtype=composite_dtype)
-        domain_train_p2i = get_p2i_composite(domain_train_data)
-        domain_train_p2i = _subset_patients(
-            domain_train_p2i,
-            fraction=float(domain_adapt_patient_fraction),
-            seed=int(domain_adapt_seed),
-        )
-        if len(domain_train_p2i) == 0:
-            raise ValueError("No domain adaptation patients after subsetting. Increase domain_adapt_patient_fraction.")
-
-        domain_sampling_strategy = str(domain_adapt_sampling_strategy).lower()
-        if domain_sampling_strategy == 'weighted':
-            domain_weights, domain_minority_patient_count = _compute_patient_sampling_weights(
-                data=domain_train_data,
-                p2i=domain_train_p2i,
-                minority_classes=minority_classes,
-                boost_factor=float(shift_sampling_boost_factor),
-                drug_only=bool(shift_sampling_drug_only),
-                drug_token_min=drug_token_min,
-                drug_token_max=drug_token_max,
-                apply_shift=bool(apply_token_shift),
-            )
-            domain_patient_weights_tensor = _weights_to_tensor(domain_weights)
-        elif domain_sampling_strategy == 'uniform':
-            domain_minority_patient_count = 0
-            domain_patient_weights_tensor = None
-        else:
-            raise ValueError(f"Unknown domain_adapt_sampling_strategy: {domain_adapt_sampling_strategy}")
-
-        if master_process:
-            print("Domain adaptation enabled:")
-            print(f"  mode: {domain_mode}")
-            print(f"  path: {domain_adapt_data_path}")
-            print(f"  patients used: {len(domain_train_p2i):,} (fraction={domain_adapt_patient_fraction})")
-            print(f"  start iter: {domain_adapt_start_iter}")
-            print(f"  LR scale (domain batches): {domain_adapt_lr_scale}")
-            print(f"  sampling: {domain_sampling_strategy}")
-            if domain_sampling_strategy == 'weighted':
-                print(f"  minority patients in domain subset: {domain_minority_patient_count:,}")
+    # ============================================================
+    # WeightedRandomSampler: Patient-level balanced sampling
+    # Oversample patients with minority SHIFT classes (Decrease/Increase)
+    # ============================================================
+    if master_process:
+        print("Computing patient-level sampling weights for SHIFT balancing...")
+    
+    # Minority SHIFT classes: 1 (Decrease), 3 (Increase) in raw encoding
+    # After +1 shift: 2 (Decrease), 4 (Increase)
+    minority_classes = [1, 3] if not apply_token_shift else [2, 4]
+    
+    # Compute per-patient minority SHIFT event count
+    patient_weights = np.zeros(len(train_p2i), dtype=np.float32)
+    for pid, (start_idx, length) in enumerate(train_p2i):
+        patient_data = train_data[start_idx:start_idx + length]
+        
+        # Only count SHIFT for drug tokens
+        drug_mask = (patient_data['DATA'] >= drug_token_min) & (patient_data['DATA'] <= drug_token_max)
+        patient_shifts = patient_data['SHIFT'][drug_mask]
+        
+        # Count minority class occurrences
+        minority_count = sum((patient_shifts == c).sum() for c in minority_classes)
+        
+        # Weight: 1 (base) + minority_count * boost_factor
+        # Patients with more minority events get higher sampling probability
+        # Reduced from 5.0 to 1.0 to prevent over-correction (hallucinating shifts)
+        patient_weights[pid] = 1.0 + minority_count * 1.0
+    
+    # Normalize to create probability distribution
+    patient_weights = patient_weights / patient_weights.sum()
+    patient_weights_tensor = torch.from_numpy(patient_weights)
+    
+    minority_patient_count = (patient_weights > 1.0 / len(train_p2i)).sum()
+    if master_process:
+        print(f"  Patients with minority SHIFT events: {minority_patient_count:,} / {len(train_p2i):,}")
+        print(f"  Max sampling weight: {patient_weights.max():.4f}, Min: {patient_weights.min():.6f}")
 else:
     # 3-column data: (ID, AGE, TOKEN)
-    train_data = np.memmap(TRAIN_DATA_PATH, dtype=np.uint32, mode='r').reshape(-1, 3)
-    val_data = np.memmap(VAL_DATA_PATH, dtype=np.uint32, mode='r').reshape(-1, 3)
-
+    train_data = np.memmap(os.path.join(data_dir, TRAIN_DATA_PATH), dtype=np.uint32, mode='r').reshape(-1, 3)
+    val_data = np.memmap(os.path.join(data_dir, VAL_DATA_PATH), dtype=np.uint32, mode='r').reshape(-1, 3)
+    
     train_p2i = get_p2i(train_data)
     val_p2i = get_p2i(val_data)
-    patient_weights_tensor = None
-
+    
     if master_process:
         print(f"Loaded 3-column data: train={len(train_data)}, val={len(val_data)}")
         print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
 
 # Downsample to requested fraction
 if data_fraction < 1.0:
-    keep_n = max(1, int(data_fraction * len(train_p2i)))
-    train_p2i = train_p2i[:keep_n]
-    if patient_weights_tensor is not None:
-        patient_weights_tensor = patient_weights_tensor[:keep_n]
-        patient_weights_tensor = patient_weights_tensor / patient_weights_tensor.sum()
+    train_p2i = train_p2i[:int(data_fraction * len(train_p2i))]
     if master_process:
         print(f"Using {data_fraction*100:.1f}% of training data: {len(train_p2i)} patients")
 
@@ -561,11 +369,6 @@ if model_type == 'composite':
         rope_theta=rope_theta,
         use_drug_conditioning=use_drug_conditioning,
         total_log_transform=total_log_transform,
-        total_loss_mode=total_loss_mode,
-        total_huber_delta=total_huber_delta,
-        total_two_stage_cls_weight=total_two_stage_cls_weight,
-        total_two_stage_reg_weight=total_two_stage_reg_weight,
-        total_two_stage_use_log=total_two_stage_use_log,
         # Composite-specific
         data_vocab_size=data_vocab_size,
         shift_vocab_size=shift_vocab_size,
@@ -591,10 +394,7 @@ if model_type == 'composite':
     elif init_from == 'resume':
         if master_process:
             print(f"Resuming Composite Delphi training from {out_dir}")
-        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-        legacy_ckpt_path = os.path.join(out_dir, 'ckpt_composite.pt')
-        if (not os.path.exists(ckpt_path)) and os.path.exists(legacy_ckpt_path):
-            ckpt_path = legacy_ckpt_path
+        ckpt_path = os.path.join(out_dir, 'ckpt_composite.pt')
         checkpoint = torch.load(ckpt_path, map_location=device)
         checkpoint_model_args = checkpoint['model_args']
         for k in ['n_layer', 'n_head', 'n_kv_head', 'n_embd', 'block_size', 'bias',
@@ -608,13 +408,7 @@ if model_type == 'composite':
         for k, v in list(state_dict.items()):
             if k.startswith(unwanted_prefix):
                 state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        load_info = model.load_state_dict(state_dict, strict=False)
-        if master_process and (load_info.missing_keys or load_info.unexpected_keys):
-            print("Checkpoint compatibility notes (composite resume):")
-            if load_info.missing_keys:
-                print(f"  Missing keys: {load_info.missing_keys}")
-            if load_info.unexpected_keys:
-                print(f"  Unexpected keys: {load_info.unexpected_keys}")
+        model.load_state_dict(state_dict)
         iter_num = checkpoint['iter_num']
         best_val_loss = checkpoint['best_val_loss']
 else:
@@ -791,129 +585,6 @@ if wandb_log:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
-train_loss_history = []
-val_loss_history = []
-
-
-def _to_float(v):
-    if torch.is_tensor(v):
-        return float(v.detach().item())
-    return float(v)
-
-
-def _maybe_save_loss_artifacts():
-    if not master_process or not save_loss_history:
-        return
-
-    payload = {
-        'model_type': model_type,
-        'train': train_loss_history,
-        'val': val_loss_history,
-        'config': {
-            'log_interval': log_interval,
-            'eval_interval': eval_interval,
-            'max_iters': max_iters,
-        }
-    }
-    history_path = os.path.join(out_dir, loss_history_filename)
-    with open(history_path, 'w') as f:
-        json.dump(payload, f, indent=2)
-    print(f"Saved loss history: {history_path}")
-
-    if not save_loss_plot:
-        return
-
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as e:
-        print(f"Skipping loss plot (matplotlib unavailable): {e}")
-        return
-
-    if len(train_loss_history) == 0 and len(val_loss_history) == 0:
-        print("Skipping loss plot (no history points).")
-        return
-
-    nrows = 2 if model_type == 'composite' else 1
-    fig, axes = plt.subplots(nrows, 1, figsize=(10, 8 if nrows == 2 else 5), sharex=True)
-    if nrows == 1:
-        axes = [axes]
-
-    train_x = [p['iter'] for p in train_loss_history]
-    train_y = [p['loss'] for p in train_loss_history]
-    val_x = [p['iter'] for p in val_loss_history]
-    val_y = [p['loss'] for p in val_loss_history]
-
-    axes[0].plot(train_x, train_y, label='train/loss', linewidth=1.3)
-    if len(val_x) > 0:
-        axes[0].plot(val_x, val_y, label='val/loss', linewidth=1.8)
-    axes[0].set_title('Training vs Validation Loss')
-    axes[0].set_ylabel('Loss')
-    axes[0].grid(alpha=0.3)
-    axes[0].legend()
-
-    if model_type == 'composite':
-        comp_keys = ['loss_data', 'loss_shift', 'loss_total', 'loss_time']
-        for k in comp_keys:
-            xs = [p['iter'] for p in val_loss_history if k in p]
-            ys = [p[k] for p in val_loss_history if k in p]
-            if len(xs) > 0:
-                axes[1].plot(xs, ys, label=f'val/{k}', linewidth=1.3)
-        axes[1].set_title('Validation Loss Components')
-        axes[1].set_ylabel('Loss')
-        axes[1].grid(alpha=0.3)
-        axes[1].legend()
-
-    axes[-1].set_xlabel('Iteration')
-    fig.tight_layout()
-
-    plot_path = os.path.join(out_dir, loss_plot_filename)
-    fig.savefig(plot_path, dpi=180, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Saved loss plot: {plot_path}")
-
-
-def _sample_patient_indices(p2i, weights_tensor):
-    if weights_tensor is not None:
-        return torch.multinomial(weights_tensor, batch_size, replacement=True)
-    return torch.randint(len(p2i), (batch_size,))
-
-
-def _should_use_domain_batch(current_iter):
-    if not (model_type == 'composite' and domain_adaptation_enabled and domain_train_p2i is not None):
-        return False
-    if current_iter < int(domain_adapt_start_iter):
-        return False
-    mode = str(domain_adapt_mode).lower()
-    if mode == 'finetune':
-        return True
-    if mode == 'mix':
-        return torch.rand(1).item() < float(domain_adapt_mix_ratio)
-    raise ValueError(f"Unknown domain_adapt_mode: {domain_adapt_mode}")
-
-
-def _next_train_batch_composite(current_iter):
-    use_domain = _should_use_domain_batch(current_iter)
-    src_data = domain_train_data if use_domain else train_data
-    src_p2i = domain_train_p2i if use_domain else train_p2i
-    src_weights = domain_patient_weights_tensor if use_domain else patient_weights_tensor
-
-    ix = _sample_patient_indices(src_p2i, src_weights)
-    batch = get_batch_composite(
-        ix,
-        src_data,
-        src_p2i,
-        block_size=block_size,
-        device=device,
-        padding='random',
-        lifestyle_augmentations=True,
-        select='left',
-        no_event_token_rate=no_event_token_rate,
-        cut_batch=True,
-        apply_token_shift=apply_token_shift,
-    )
-    return batch, ('domain' if use_domain else 'base')
-
-
 # =============================================================================
 # Training Loop
 # =============================================================================
@@ -927,19 +598,17 @@ if master_process:
     print(f"  Block size: {block_size}")
     print(f"  Max iterations: {max_iters}")
     print(f"  Learning rate: {learning_rate}")
-    if model_type == 'composite':
-        print(f"  SHIFT loss: {shift_loss_type} (auto_weight_mode={shift_auto_class_weight_mode}, sampling={shift_sampling_strategy})")
-        print(f"  TOTAL loss mode: {total_loss_mode} (log_space={total_log_transform})")
-        if domain_adaptation_enabled:
-            print(f"  Domain adaptation: mode={domain_adapt_mode}, mix_ratio={domain_adapt_mix_ratio}, lr_scale={domain_adapt_lr_scale}")
     print(f"{'='*60}\n")
 
-# Initial batch
+# Initial batch (weighted sampling for SHIFT class balance)
 if model_type == 'composite':
-    batch, batch_source = _next_train_batch_composite(iter_num)
+    ix = torch.multinomial(patient_weights_tensor, batch_size, replacement=True)
+    batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
+                                padding='random', lifestyle_augmentations=True, select='left',
+                                no_event_token_rate=no_event_token_rate,
+                                apply_token_shift=apply_token_shift)
     x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
 else:
-    batch_source = 'base'
     ix = torch.randint(len(train_p2i), (batch_size,))
     X, A, Y, B = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
                            padding='random', lifestyle_augmentations=True, select='left',
@@ -951,10 +620,7 @@ val_loss = None
 
 while True:
     # Set learning rate
-    base_lr = get_lr(iter_num) if decay_lr else learning_rate
-    lr = base_lr
-    if model_type == 'composite' and batch_source == 'domain':
-        lr = base_lr * float(domain_adapt_lr_scale)
+    lr = get_lr(iter_num) if decay_lr else learning_rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -992,14 +658,6 @@ while True:
                         "val/loss_total": val_loss_unpooled[3].item(),
                         "val/loss_time": val_loss_unpooled[4].item(),
                     })
-                val_loss_history.append({
-                    'iter': int(iter_num),
-                    'loss': _to_float(val_loss),
-                    'loss_data': _to_float(val_loss_unpooled[1]),
-                    'loss_shift': _to_float(val_loss_unpooled[2]),
-                    'loss_total': _to_float(val_loss_unpooled[3]),
-                    'loss_time': _to_float(val_loss_unpooled[4]),
-                })
         else:
             # Modern model has 2 loss components (ce, dt)
             if val_loss is None:
@@ -1018,12 +676,6 @@ while True:
                         "val/loss_ce": val_loss_unpooled[0].item(),
                         "val/loss_dt": val_loss_unpooled[1].item(),
                     })
-                val_loss_history.append({
-                    'iter': int(iter_num),
-                    'loss': _to_float(val_loss),
-                    'loss_ce': _to_float(val_loss_unpooled[0]),
-                    'loss_dt': _to_float(val_loss_unpooled[1]),
-                })
 
         # Save best checkpoint (master only)
         if master_process and (always_save_checkpoint or val_loss < best_val_loss):
@@ -1071,8 +723,12 @@ while True:
                     y_data, y_shift, y_total, y_ages
                 )
             
-            # Prefetch next batch
-            batch, batch_source = _next_train_batch_composite(iter_num)
+            # Prefetch next batch (weighted sampling for SHIFT class balance)
+            ix = torch.multinomial(patient_weights_tensor, batch_size, replacement=True)
+            batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
+                                        padding='random', lifestyle_augmentations=True, select='left',
+                                        no_event_token_rate=no_event_token_rate, cut_batch=True,
+                                        apply_token_shift=apply_token_shift)
             x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
             
             # Total loss
@@ -1086,7 +742,6 @@ while True:
             X, A, Y, B = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
                                    padding='random', lifestyle_augmentations=True, select='left',
                                    no_event_token_rate=no_event_token_rate, cut_batch=True)
-            batch_source = 'base'
             
             # Combined loss
             total_loss = loss['loss_ce'] + loss['loss_dt']
@@ -1103,8 +758,7 @@ while True:
         grad_info = []
         for name, param in raw_model.named_parameters():
             if param.grad is not None:
-                if ('total_head' in name or 'total_nonzero_head' in name or
-                        'time_head' in name or 'time_shape_head' in name):
+                if 'total_head' in name or 'time_head' in name or 'time_shape_head' in name:
                     grad_norm = param.grad.norm().item()
                     grad_info.append(f"{name.split('.')[-2]}={grad_norm:.6f}")
         if grad_info:
@@ -1126,9 +780,9 @@ while True:
         if iter_num > 0 and iter_num % (log_interval * 10) == 0:
             prev_lr = get_lr(iter_num - log_interval) if decay_lr else learning_rate
             lr_change = "↑" if lr > prev_lr else "↓" if lr < prev_lr else "="
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {lr:.2e} {lr_change} (warmup: {iter_num < warmup_iters}, decay: {iter_num > warmup_iters}, batch={batch_source})")
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {lr:.2e} {lr_change} (warmup: {iter_num < warmup_iters}, decay: {iter_num > warmup_iters})")
         else:
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {lr:.2e}, batch={batch_source}")
+            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {lr:.2e}")
 
         if wandb_log:
             log_dict = {
@@ -1142,25 +796,8 @@ while True:
                     "train/loss_shift": loss['loss_shift'].item(),
                     "train/loss_total": loss['loss_total'].item(),
                     "train/loss_time": loss['loss_time'].item(),
-                    "train/is_domain_batch": 1 if batch_source == 'domain' else 0,
                 })
             wandb.log(log_dict)
-
-        point = {
-            'iter': int(iter_num),
-            'loss': _to_float(total_loss),
-            'lr': _to_float(lr),
-            'time_ms': _to_float(dt * 1000.0),
-            'batch_source': batch_source,
-        }
-        if model_type == 'composite':
-            point.update({
-                'loss_data': _to_float(loss['loss_data']),
-                'loss_shift': _to_float(loss['loss_shift']),
-                'loss_total': _to_float(loss['loss_total']),
-                'loss_time': _to_float(loss['loss_time']),
-            })
-        train_loss_history.append(point)
 
     iter_num += 1
     local_iter_num += 1
@@ -1170,7 +807,6 @@ while True:
         break
 
 if master_process:
-    _maybe_save_loss_artifacts()
     print(f"\n{'='*60}")
     print(f"Training completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")
