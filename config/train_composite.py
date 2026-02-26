@@ -50,7 +50,7 @@ loss_weight_total = 0.5
 loss_weight_unit = 0.5
 loss_weight_time = 1.0
 
-# modern features
+# architecture features
 use_moe = True
 num_experts = 8
 experts_per_token = 2

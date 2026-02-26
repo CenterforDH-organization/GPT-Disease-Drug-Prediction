@@ -4,12 +4,12 @@ import warnings
 import torch
 # Suppress sklearn warnings about classes not in y_true
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.metrics._classification')
-from model import ModernDelphi, ModernDelphiConfig, CompositeDelphi, CompositeDelphiConfig
+from model import CompositeDelphi, CompositeDelphiConfig
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
 import argparse
-from utils import get_batch, get_p2i, get_batch_composite, get_p2i_composite
+from utils import get_batch_composite, get_p2i_composite
 from pathlib import Path
 from sklearn.metrics import (
     accuracy_score, 
@@ -712,7 +712,7 @@ def evaluate_auc_pipeline(
     d100k,
     output_path,
     labels_df,
-    model_type='modern',  # 'modern' or 'composite'
+    model_type='composite',
     evaluate_composite=True,
     diseases_of_interest=None,
     filter_min_total=100,
@@ -731,10 +731,10 @@ def evaluate_auc_pipeline(
 
     Args:
         model (torch.nn.Module): The loaded model set to eval().
-        d100k: Data batch from get_batch (ModernDelphi) or get_batch_composite (CompositeDelphi).
+        d100k: Data batch from get_batch_composite (CompositeDelphi).
         labels_df (pd.DataFrame): DataFrame with label info (token names, etc.).
         output_path (str | None): Directory where CSV files will be written. If None, files will not be saved.
-        model_type (str): 'modern' or 'composite'
+        model_type (str): must be 'composite'
         diseases_of_interest (np.ndarray or list, optional): If provided, these disease indices are used.
         filter_min_total (int): Minimum total token count to include a token.
         disease_chunk_size (int): Maximum chunk size for processing diseases.
@@ -782,13 +782,13 @@ def evaluate_auc_pipeline(
     # Note: token indices are 0-based, so valid range is [0, vocab_size)
     diseases_of_interest = [d for d in diseases_of_interest if 0 <= d < vocab_size]
     
+    if model_type != 'composite':
+        raise ValueError("Only composite model_type is supported.")
+
     # CRITICAL: Filter to only include tokens that actually exist in the evaluation data
     # This prevents evaluating tokens like SGLT-2 or Other that may not exist in val/test data
-    if model_type == 'composite':
-        target_data_np = d100k[4].cpu().detach().numpy()  # y_data (target DATA tokens)
-        # d100k = (x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages)
-    else:
-        target_data_np = d100k[2].cpu().detach().numpy()  # targets
+    target_data_np = d100k[4].cpu().detach().numpy()  # y_data (target DATA tokens)
+    # d100k = (x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages)
     
     actual_tokens_in_data = set(np.unique(target_data_np).tolist())
     # Remove invalid tokens like -1 (padding)
@@ -823,32 +823,11 @@ def evaluate_auc_pipeline(
     diseases_chunks = np.array_split(diseases_of_interest, num_chunks)
 
     # Precompute prediction indices for calibration
-    # d100k structure:
-    # ModernDelphi: (x, a, y, b) = (tokens, ages, targets, target_ages)
-    # CompositeDelphi: (x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages)
-    if model_type == 'composite':
-        # For composite: d100k is tuple from get_batch_composite
-        # We need to extract: data, ages, and create disease_tokens, target_ages
-        # d100k = (x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages)
-        data_tokens = d100k[0].cpu().detach().numpy()  # x_data
-        ages = d100k[3].cpu().detach().numpy()  # x_ages
-        target_data = d100k[4].cpu().detach().numpy()  # y_data
-        target_ages = d100k[7].cpu().detach().numpy()  # y_ages
-        
-        # Create d structure for get_calibration_auc
-        # d[0]: input tokens, d[1]: input ages, d[2]: target tokens, d[3]: target ages
-        d = [data_tokens, ages, target_data, target_ages]
-    else:
-        # For modern: d100k is tuple from get_batch
-        # Structure: (x, a, y, b) = (tokens, ages, targets, target_ages)
-        tokens = d100k[0].cpu().detach().numpy()  # x
-        ages = d100k[1].cpu().detach().numpy()  # a
-        targets = d100k[2].cpu().detach().numpy()  # y
-        target_ages = d100k[3].cpu().detach().numpy()  # b
-        
-        # Create d structure for get_calibration_auc
-        # d[0]: input tokens, d[1]: input ages, d[2]: target tokens, d[3]: target ages
-        d = [tokens, ages, targets, target_ages]
+    data_tokens = d100k[0].cpu().detach().numpy()  # x_data
+    ages = d100k[3].cpu().detach().numpy()  # x_ages
+    target_data = d100k[4].cpu().detach().numpy()  # y_data
+    target_ages = d100k[7].cpu().detach().numpy()  # y_ages
+    d = [data_tokens, ages, target_data, target_ages]
     
     # Precompute prediction indices: find positions where input age <= target age - offset
     pred_idx_precompute = (d[1][:, :, np.newaxis] <= d[3][:, np.newaxis, :] - offset).sum(1) - 1
@@ -870,43 +849,23 @@ def evaluate_auc_pipeline(
         model.eval()
         with torch.no_grad():
             # Process the evaluation data in batches
-            if model_type == 'composite':
-                # CompositeDelphi: need to split all fields
-                x_data, x_shift, x_total, x_ages = d100k[0], d100k[1], d100k[2], d100k[3]
-                
-                num_batches = (x_data.shape[0] + batch_size - 1) // batch_size
-                for batch_idx in tqdm(range(num_batches), desc=f"Model inference, chunk {disease_chunk_idx}"):
-                    start_idx = batch_idx * batch_size
-                    end_idx = min(start_idx + batch_size, x_data.shape[0])
-                    
-                    batch_x_data = x_data[start_idx:end_idx].to(device)
-                    batch_x_shift = x_shift[start_idx:end_idx].to(device)
-                    batch_x_total = x_total[start_idx:end_idx].to(device)
-                    batch_x_ages = x_ages[start_idx:end_idx].to(device)
-                    
-                    outputs = model(
-                        batch_x_data, batch_x_shift, batch_x_total, batch_x_ages
-                    )[0]  # Get logits dict
-                    
-                    # Extract data logits for the current disease chunk
-                    data_logits = outputs['data'].cpu().detach().numpy()
-                    # diseases_chunk contains actual token IDs, use them as indices
-                    p100k.append(data_logits[:, :, diseases_chunk].astype("float16"))
-            else:
-                # ModernDelphi: simpler structure
-                x, a = d100k[0], d100k[1]
-                
-                num_batches = (x.shape[0] + batch_size - 1) // batch_size
-                for batch_idx in tqdm(range(num_batches), desc=f"Model inference, chunk {disease_chunk_idx}"):
-                    start_idx = batch_idx * batch_size
-                    end_idx = min(start_idx + batch_size, x.shape[0])
-                    
-                    batch_x = x[start_idx:end_idx].to(device)
-                    batch_a = a[start_idx:end_idx].to(device)
-                    
-                    outputs = model(batch_x, batch_a)[0].cpu().detach().numpy()
-                    # diseases_chunk contains actual token IDs, use them as indices
-                    p100k.append(outputs[:, :, diseases_chunk].astype("float16"))
+            x_data, x_shift, x_total, x_ages = d100k[0], d100k[1], d100k[2], d100k[3]
+            num_batches = (x_data.shape[0] + batch_size - 1) // batch_size
+            for batch_idx in tqdm(range(num_batches), desc=f"Model inference, chunk {disease_chunk_idx}"):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, x_data.shape[0])
+
+                batch_x_data = x_data[start_idx:end_idx].to(device)
+                batch_x_shift = x_shift[start_idx:end_idx].to(device)
+                batch_x_total = x_total[start_idx:end_idx].to(device)
+                batch_x_ages = x_ages[start_idx:end_idx].to(device)
+
+                outputs = model(
+                    batch_x_data, batch_x_shift, batch_x_total, batch_x_ages
+                )[0]  # Get logits dict
+
+                data_logits = outputs['data'].cpu().detach().numpy()
+                p100k.append(data_logits[:, :, diseases_chunk].astype("float16"))
         
         if len(p100k) == 0:
             print(f"Skipping chunk {disease_chunk_idx}: no predictions generated")
@@ -1006,7 +965,7 @@ def evaluate_auc_pipeline(
     
     # Evaluate composite fields (SHIFT, TOTAL) if composite model and enabled
     composite_metrics = None
-    if model_type == 'composite' and evaluate_composite:
+    if evaluate_composite:
         print("\nEvaluating composite fields (SHIFT, TOTAL)...")
         composite_metrics = evaluate_composite_fields(
             model, d100k, batch_size=batch_size, device=device
@@ -1168,8 +1127,8 @@ def main():
     parser.add_argument("--input_path", type=str, default="../data", help="Path to the dataset")
     parser.add_argument("--output_path", type=str, default="results", help="Path to the output")
     parser.add_argument("--model_ckpt_path", type=str, required=True, help="Path to the model weights")
-    parser.add_argument("--model_type", type=str, default='modern', choices=['modern', 'composite'],
-                        help="Model type: 'modern' or 'composite'")
+    parser.add_argument("--model_type", type=str, default='composite', choices=['composite'],
+                        help="Model type (composite only)")
     parser.add_argument("--no_event_token_rate", type=int, default=5, help="No event token rate")
     parser.add_argument(
         "--health_token_replacement_prob", default=0.0, type=float, help="Health token replacement probability"
@@ -1212,12 +1171,8 @@ def main():
     num_experts = model_args.get('num_experts', 0)
     experts_per_token = model_args.get('experts_per_token', 0)
     
-    if model_type == 'composite':
-        conf = CompositeDelphiConfig(**model_args)
-        model = CompositeDelphi(conf)
-    else:
-        conf = ModernDelphiConfig(**model_args)
-        model = ModernDelphi(conf)
+    conf = CompositeDelphiConfig(**model_args)
+    model = CompositeDelphi(conf)
     
     state_dict = checkpoint["model"]
     # Strip DDP 'module.' or torch.compile '_orig_mod.' prefixes if present
@@ -1332,17 +1287,9 @@ def main():
     if Path(train_data_path).exists():
         print(f"\nLoading train data to filter valid tokens: {train_data_path}")
         print(f"  Train prefix: '{train_prefix}' (filtering will only apply to data files with same prefix)")
-        if model_type == 'composite':
-            train_data_raw = np.fromfile(train_data_path, dtype=composite_dtype)
-            # Get unique DATA tokens from train (raw values, before +1 shift)
-            train_raw_tokens = np.unique(train_data_raw['DATA'])
-            # Apply +1 shift (same as get_batch_composite)
-            train_valid_tokens = set((train_raw_tokens + 1).tolist())
-        else:
-            train_data_raw = np.fromfile(train_data_path, dtype=np.uint32).reshape(-1, 3)
-            train_raw_tokens = np.unique(train_data_raw[:, 2])
-            # Apply +1 shift (same as get_batch)
-            train_valid_tokens = set((train_raw_tokens + 1).tolist())
+        train_data_raw = np.fromfile(train_data_path, dtype=composite_dtype)
+        train_raw_tokens = np.unique(train_data_raw['DATA'])
+        train_valid_tokens = set((train_raw_tokens + 1).tolist())
         
         print(f"  Train data contains {len(train_valid_tokens)} unique tokens (after +1 shift)")
         
@@ -1377,12 +1324,8 @@ def main():
         print(f"{'='*60}\n")
         
         # Load data
-        if model_type == 'composite':
-            data = np.fromfile(data_filepath, dtype=composite_dtype)
-            data_p2i = get_p2i_composite(data)
-        else:
-            data = np.fromfile(data_filepath, dtype=np.uint32).reshape(-1, 3).astype(np.int64)
-            data_p2i = get_p2i(data)
+        data = np.fromfile(data_filepath, dtype=composite_dtype)
+        data_p2i = get_p2i_composite(data)
         
         # Determine subset size
         current_subset_size = dataset_subset_size
@@ -1399,29 +1342,17 @@ def main():
         patient_indices = sorted(patient_indices)
         
         # Get a subset batch for evaluation
-        if model_type == 'composite':
-            d100k = get_batch_composite(
-                patient_indices,
-                data,
-                data_p2i,
-                select="left",
-                block_size=args.block_size,
-                device=device,
-                padding="random",
-                no_event_token_rate=no_event_token_rate,
-                apply_token_shift=False,  # Ensure no +1 shift, matching training config
-            )
-        else:
-            d100k = get_batch(
-                patient_indices,
-                data,
-                data_p2i,
-                select="left",
-                block_size=args.block_size,
-                device=device,
-                padding="random",
-                no_event_token_rate=no_event_token_rate,
-            )
+        d100k = get_batch_composite(
+            patient_indices,
+            data,
+            data_p2i,
+            select="left",
+            block_size=args.block_size,
+            device=device,
+            padding="random",
+            no_event_token_rate=no_event_token_rate,
+            apply_token_shift=False,  # Ensure no +1 shift, matching training config
+        )
         
         # Prepare meta info with data source
         meta_info = base_meta_info.copy()
@@ -1448,32 +1379,25 @@ def main():
             train_valid_tokens=None,  # No train filtering - evaluate all tokens in data
         )
         
-        if model_type == 'composite':
-            df_auc_unpooled, df_auc_merged, composite_metrics = result
-            
-            # Initialize composite_metrics if None (e.g., when no drug tokens in data)
-            if composite_metrics is None:
-                composite_metrics = {}
-            
-            # Add AUC statistics to composite_metrics if available
-            if df_auc_merged is not None and not df_auc_merged.empty and 'auc' in df_auc_merged.columns:
-                auc_values = df_auc_merged['auc'].dropna()
-                if not auc_values.empty:
-                    composite_metrics['auc_mean'] = float(auc_values.mean())
-                    composite_metrics['auc_median'] = float(auc_values.median())
-                    composite_metrics['auc_min'] = float(auc_values.min())
-                    composite_metrics['auc_max'] = float(auc_values.max())
-                    composite_metrics['auc_std'] = float(auc_values.std())
-                    composite_metrics['n_diseases_auc'] = int(len(auc_values))
-                    
-                    # Print AUC stats to console
-                    print(f"\n[AUC Statistics] (Next Disease Prediction)")
-                    print(f"  Mean:   {composite_metrics['auc_mean']:.4f}")
-                    print(f"  Median: {composite_metrics['auc_median']:.4f}")
-                    print(f"  Min/Max: {composite_metrics['auc_min']:.4f} / {composite_metrics['auc_max']:.4f}")
-        else:
-            df_auc_unpooled, df_auc_merged = result[:2]
-            composite_metrics = None
+        df_auc_unpooled, df_auc_merged, composite_metrics = result
+
+        if composite_metrics is None:
+            composite_metrics = {}
+
+        if df_auc_merged is not None and not df_auc_merged.empty and 'auc' in df_auc_merged.columns:
+            auc_values = df_auc_merged['auc'].dropna()
+            if not auc_values.empty:
+                composite_metrics['auc_mean'] = float(auc_values.mean())
+                composite_metrics['auc_median'] = float(auc_values.median())
+                composite_metrics['auc_min'] = float(auc_values.min())
+                composite_metrics['auc_max'] = float(auc_values.max())
+                composite_metrics['auc_std'] = float(auc_values.std())
+                composite_metrics['n_diseases_auc'] = int(len(auc_values))
+
+                print(f"\n[AUC Statistics] (Next Disease Prediction)")
+                print(f"  Mean:   {composite_metrics['auc_mean']:.4f}")
+                print(f"  Median: {composite_metrics['auc_median']:.4f}")
+                print(f"  Min/Max: {composite_metrics['auc_min']:.4f} / {composite_metrics['auc_max']:.4f}")
         
         # Save results with prefix
         if output_path is not None:

@@ -1,6 +1,5 @@
 """
-Modern/Composite Delphi Training Script
-Supports both ModernDelphi (3-column) and CompositeDelphi (6-column) models
+Composite Delphi v2 Training Script
 """
 
 import os
@@ -13,12 +12,10 @@ import numpy as np
 import torch
 
 from model_v2 import (
-    ModernDelphi,
-    ModernDelphiConfig,
     CompositeDelphiV2,
     CompositeDelphiV2Config,
 )
-from utils import get_p2i, get_batch, get_p2i_composite, get_batch_composite
+from utils import get_p2i_composite, get_batch_composite
 
 # =============================================================================
 # Default Configuration
@@ -35,7 +32,7 @@ seed = 42
 
 # wandb logging
 wandb_log = False
-wandb_project = 'modern-delphi'
+wandb_project = 'composite-delphi-v2'
 wandb_run_name = 'run' + str(time.time())
 
 # data
@@ -43,18 +40,16 @@ gradient_accumulation_steps = 1
 batch_size = 96
 block_size = 512
 
-# model selection: 'modern' or 'composite'
+# model selection (composite only)
 model_type = 'composite'
 
-# Modern Delphi model config (3-column data)
+# Model config
 n_layer = 8          # Scaled up from 6
 n_head = 6
 n_kv_head = 2  # GQA (must divide n_head evenly: 6/2=3 heads per group)
 n_embd = 192         # Scaled up from 96 for better capacity
 dropout = 0.3
 bias = False
-vocab_size = 1290  # Must include Death token (raw 1288 → shifted 1289)
-
 # Composite Delphi model config (5-column data)
 data_vocab_size = 1290   # DATA: 약품/질병 코드 수 (Classification)
 shift_vocab_size = 5     # SHIFT: Classification (values 0-4)
@@ -72,7 +67,7 @@ loss_weight_shift = 15.0  # Increased from 5.0 to heavily emphasize SHIFT learni
 loss_weight_total = 100.0
 loss_weight_time = 0.1
 
-# modern features
+# architecture features
 use_moe = True
 num_experts = 8
 experts_per_token = 2
@@ -134,6 +129,9 @@ if apply_token_shift:
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
+if model_type != 'composite':
+    raise ValueError("Only composite model_type is supported.")
+
 # Set device after config parsing (gpu_id can be overridden via command line)
 if torch.cuda.is_available():
     device = f'cuda:{gpu_id}'
@@ -176,97 +174,53 @@ def _compute_shift_class_weights(shift_values, shift_vocab_size, shift_ignore_in
         weights[nonzero] = counts[nonzero].sum() / (counts[nonzero] * nonzero.sum())
     return weights.tolist()
 
-if model_type == 'composite':
-    # 6-column structured data: (ID, AGE, DATA, DOSE, TOTAL, UNIT)
-    # composite_dtype = np.dtype([
-    #     ('ID', '<u4'),
-    #     ('AGE', '<u4'),
-    #     ('DATA', '<u4'),
-    #     ('DOSE', '<f4'),
-    #     ('TOTAL', '<u4'),
-    #     ('UNIT', '<u4')
-    # ])
+# 6-column structured data: (ID, AGE, DATA, DOSE, TOTAL, UNIT)
+composite_dtype = np.dtype([
+    ('ID', np.uint32),
+    ('AGE', np.uint32),
+    ('DATA', np.uint32),
+    ('SHIFT', np.uint32),
+    ('TOTAL', np.uint32)
+])
 
-    composite_dtype = np.dtype([
-        ('ID', np.uint32),
-        ('AGE', np.uint32),
-        ('DATA', np.uint32),
-        ('SHIFT', np.uint32),
-        ('TOTAL', np.uint32)
-    ])
+train_data = np.fromfile(TRAIN_DATA_PATH, dtype=composite_dtype)
+val_data = np.fromfile(VAL_DATA_PATH, dtype=composite_dtype)
 
-    # train_data = np.memmap(TRAIN_DATA_PATH, dtype=composite_dtype, mode='r')
-    # val_data = np.memmap(VAL_DATA_PATH, dtype=composite_dtype, mode='r')
+train_p2i = get_p2i_composite(train_data)
+val_p2i = get_p2i_composite(val_data)
 
-    train_data = np.fromfile(TRAIN_DATA_PATH, dtype=composite_dtype)
-    val_data = np.fromfile(VAL_DATA_PATH, dtype=composite_dtype)
-    
-    train_p2i = get_p2i_composite(train_data)
-    val_p2i = get_p2i_composite(val_data)
-    
-    print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
-    print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
+print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
+print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
 
-    # Dynamic Class Weighting (SHIFT)
-    # Compute weights from drug-token subset to handle class imbalance
-    if not shift_class_weights:
-        drug_token_min = 1279 if apply_token_shift else 1278
-        drug_token_max = 1289 if apply_token_shift else 1288
-        drug_mask = (train_data['DATA'] >= drug_token_min) & (train_data['DATA'] <= drug_token_max)
-        shift_values = train_data['SHIFT'][drug_mask].astype(np.int64)
-        if apply_token_shift:
-            shift_values = shift_values + 1
-        shift_class_weights = _compute_shift_class_weights(
-            shift_values,
-            shift_vocab_size,
-            shift_ignore_index,
-        )
-        print(f"Computed shift class weights (drug-token subset): {shift_class_weights}")
+if not shift_class_weights:
+    drug_token_min = 1279 if apply_token_shift else 1278
+    drug_token_max = 1289 if apply_token_shift else 1288
+    drug_mask = (train_data['DATA'] >= drug_token_min) & (train_data['DATA'] <= drug_token_max)
+    shift_values = train_data['SHIFT'][drug_mask].astype(np.int64)
+    if apply_token_shift:
+        shift_values = shift_values + 1
+    shift_class_weights = _compute_shift_class_weights(
+        shift_values,
+        shift_vocab_size,
+        shift_ignore_index,
+    )
+    print(f"Computed shift class weights (drug-token subset): {shift_class_weights}")
 
-    # ============================================================
-    # WeightedRandomSampler: Patient-level balanced sampling
-    # Oversample patients with minority SHIFT classes (Decrease/Increase)
-    # ============================================================
-    print("Computing patient-level sampling weights for SHIFT balancing...")
-    
-    # Minority SHIFT classes: 1 (Decrease), 3 (Increase) in raw encoding
-    # After +1 shift: 2 (Decrease), 4 (Increase)
-    minority_classes = [1, 3] if not apply_token_shift else [2, 4]
-    
-    # Compute per-patient minority SHIFT event count
-    patient_weights = np.zeros(len(train_p2i), dtype=np.float32)
-    for pid, (start_idx, length) in enumerate(train_p2i):
-        patient_data = train_data[start_idx:start_idx + length]
-        
-        # Only count SHIFT for drug tokens
-        drug_mask = (patient_data['DATA'] >= drug_token_min) & (patient_data['DATA'] <= drug_token_max)
-        patient_shifts = patient_data['SHIFT'][drug_mask]
-        
-        # Count minority class occurrences
-        minority_count = sum((patient_shifts == c).sum() for c in minority_classes)
-        
-        # Weight: 1 (base) + minority_count * boost_factor
-        # Patients with more minority events get higher sampling probability
-        # Reduced from 5.0 to 1.0 to prevent over-correction (hallucinating shifts)
-        patient_weights[pid] = 1.0 + minority_count * 1.0
-    
-    # Normalize to create probability distribution
-    patient_weights = patient_weights / patient_weights.sum()
-    patient_weights_tensor = torch.from_numpy(patient_weights)
-    
-    minority_patient_count = (patient_weights > 1.0 / len(train_p2i)).sum()
-    print(f"  Patients with minority SHIFT events: {minority_patient_count:,} / {len(train_p2i):,}")
-    print(f"  Max sampling weight: {patient_weights.max():.4f}, Min: {patient_weights.min():.6f}")
-else:
-    # 3-column data: (ID, AGE, TOKEN)
-    train_data = np.memmap(os.path.join(data_dir, TRAIN_DATA_PATH), dtype=np.uint32, mode='r').reshape(-1, 3)
-    val_data = np.memmap(os.path.join(data_dir, VAL_DATA_PATH), dtype=np.uint32, mode='r').reshape(-1, 3)
-    
-    train_p2i = get_p2i(train_data)
-    val_p2i = get_p2i(val_data)
-    
-    print(f"Loaded 3-column data: train={len(train_data)}, val={len(val_data)}")
-    print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
+print("Computing patient-level sampling weights for SHIFT balancing...")
+minority_classes = [1, 3] if not apply_token_shift else [2, 4]
+patient_weights = np.zeros(len(train_p2i), dtype=np.float32)
+for pid, (start_idx, length) in enumerate(train_p2i):
+    patient_data = train_data[start_idx:start_idx + length]
+    drug_mask = (patient_data['DATA'] >= drug_token_min) & (patient_data['DATA'] <= drug_token_max)
+    patient_shifts = patient_data['SHIFT'][drug_mask]
+    minority_count = sum((patient_shifts == c).sum() for c in minority_classes)
+    patient_weights[pid] = 1.0 + minority_count * 1.0
+
+patient_weights = patient_weights / patient_weights.sum()
+patient_weights_tensor = torch.from_numpy(patient_weights)
+minority_patient_count = (patient_weights > 1.0 / len(train_p2i)).sum()
+print(f"  Patients with minority SHIFT events: {minority_patient_count:,} / {len(train_p2i):,}")
+print(f"  Max sampling weight: {patient_weights.max():.4f}, Min: {patient_weights.min():.6f}")
 
 # Downsample to requested fraction
 if data_fraction < 1.0:
@@ -280,115 +234,64 @@ best_val_loss = 1e9
 # Model Initialization
 # =============================================================================
 
-if model_type == 'composite':
-    # Composite Delphi with multi-head output
-    model_args = dict(
-        n_layer=n_layer,
-        n_head=n_head,
-        n_kv_head=n_kv_head,
-        n_embd=n_embd,
-        block_size=block_size,
-        bias=bias,
-        dropout=dropout,
-        token_dropout=token_dropout,
-        t_min=t_min,
-        mask_ties=mask_ties,
-        ignore_tokens=ignore_tokens,
-        use_moe=use_moe,
-        num_experts=num_experts,
-        experts_per_token=experts_per_token,
-        sliding_window=sliding_window,
-        rope_theta=rope_theta,
-        use_drug_conditioning=use_drug_conditioning,
-        use_fpg_conditioning=use_fpg_conditioning,
-        fpg_token_ids=fpg_token_ids,
-        fpg_condition_scale=fpg_condition_scale,
-        # Composite-specific
-        data_vocab_size=data_vocab_size,
-        shift_vocab_size=shift_vocab_size,
-        total_vocab_size=total_vocab_size,
-        # SHIFT loss options
-        shift_loss_type=shift_loss_type,
-        shift_ignore_index=shift_ignore_index,
-        shift_focal_gamma=shift_focal_gamma,
-        shift_class_weights=shift_class_weights,
-        loss_weight_data=loss_weight_data,
-        loss_weight_shift=loss_weight_shift,
-        loss_weight_total=loss_weight_total,
-        loss_weight_time=loss_weight_time,
-        # Time-to-Event distribution
-        time_distribution=time_distribution,
-    )
-    
-    if init_from == 'scratch':
-        print("Initializing a new Composite Delphi v2 model from scratch")
-        gptconf = CompositeDelphiV2Config(**model_args)
-        model = CompositeDelphiV2(gptconf)
-    elif init_from == 'resume':
-        print(f"Resuming Composite Delphi v2 training from {out_dir}")
-        ckpt_path = os.path.join(out_dir, 'ckpt_composite_v2.pt')
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        checkpoint_model_args = checkpoint['model_args']
-        for k in ['n_layer', 'n_head', 'n_kv_head', 'n_embd', 'block_size', 'bias',
-                  'data_vocab_size', 'shift_vocab_size', 'total_vocab_size']:
-            if k in checkpoint_model_args:
-                model_args[k] = checkpoint_model_args[k]
-        gptconf = CompositeDelphiV2Config(**model_args)
-        model = CompositeDelphiV2(gptconf)
-        state_dict = checkpoint['model']
-        unwanted_prefix = '_orig_mod.'
-        for k, v in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
-        iter_num = checkpoint['iter_num']
-        best_val_loss = checkpoint['best_val_loss']
-else:
-    # Modern Delphi (original)
-    model_args = dict(
-        n_layer=n_layer,
-        n_head=n_head,
-        n_kv_head=n_kv_head,
-        n_embd=n_embd,
-        block_size=block_size,
-        bias=bias,
-        vocab_size=vocab_size,
-        dropout=dropout,
-        token_dropout=token_dropout,
-        t_min=t_min,
-        mask_ties=mask_ties,
-        ignore_tokens=ignore_tokens,
-        use_moe=use_moe,
-        num_experts=num_experts,
-        experts_per_token=experts_per_token,
-        sliding_window=sliding_window,
-        rope_theta=rope_theta,
-        # Time-to-Event distribution
-        time_distribution=time_distribution,
-    )
-    
-    if init_from == 'scratch':
-        print("Initializing a new Modern Delphi model from scratch")
-        gptconf = ModernDelphiConfig(**model_args)
-        model = ModernDelphi(gptconf)
-    elif init_from == 'resume':
-        print(f"Resuming Modern Delphi training from {out_dir}")
-        ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-        checkpoint = torch.load(ckpt_path, map_location=device)
-        checkpoint_model_args = checkpoint['model_args']
-        for k in ['n_layer', 'n_head', 'n_kv_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
-            if k in checkpoint_model_args:
-                model_args[k] = checkpoint_model_args[k]
-        gptconf = ModernDelphiConfig(**model_args)
-        model = ModernDelphi(gptconf)
-        state_dict = checkpoint['model']
-        unwanted_prefix = '_orig_mod.'
-        for k, v in list(state_dict.items()):
-            if k.startswith(unwanted_prefix):
-                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-        model.load_state_dict(state_dict)
-        iter_num = checkpoint['iter_num']
-        best_val_loss = checkpoint['best_val_loss']
+model_args = dict(
+    n_layer=n_layer,
+    n_head=n_head,
+    n_kv_head=n_kv_head,
+    n_embd=n_embd,
+    block_size=block_size,
+    bias=bias,
+    dropout=dropout,
+    token_dropout=token_dropout,
+    t_min=t_min,
+    mask_ties=mask_ties,
+    ignore_tokens=ignore_tokens,
+    use_moe=use_moe,
+    num_experts=num_experts,
+    experts_per_token=experts_per_token,
+    sliding_window=sliding_window,
+    rope_theta=rope_theta,
+    use_drug_conditioning=use_drug_conditioning,
+    use_fpg_conditioning=use_fpg_conditioning,
+    fpg_token_ids=fpg_token_ids,
+    fpg_condition_scale=fpg_condition_scale,
+    data_vocab_size=data_vocab_size,
+    shift_vocab_size=shift_vocab_size,
+    total_vocab_size=total_vocab_size,
+    shift_loss_type=shift_loss_type,
+    shift_ignore_index=shift_ignore_index,
+    shift_focal_gamma=shift_focal_gamma,
+    shift_class_weights=shift_class_weights,
+    loss_weight_data=loss_weight_data,
+    loss_weight_shift=loss_weight_shift,
+    loss_weight_total=loss_weight_total,
+    loss_weight_time=loss_weight_time,
+    time_distribution=time_distribution,
+)
+
+if init_from == 'scratch':
+    print("Initializing a new Composite Delphi v2 model from scratch")
+    gptconf = CompositeDelphiV2Config(**model_args)
+    model = CompositeDelphiV2(gptconf)
+elif init_from == 'resume':
+    print(f"Resuming Composite Delphi v2 training from {out_dir}")
+    ckpt_path = os.path.join(out_dir, 'ckpt_composite_v2.pt')
+    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint_model_args = checkpoint['model_args']
+    for k in ['n_layer', 'n_head', 'n_kv_head', 'n_embd', 'block_size', 'bias',
+              'data_vocab_size', 'shift_vocab_size', 'total_vocab_size']:
+        if k in checkpoint_model_args:
+            model_args[k] = checkpoint_model_args[k]
+    gptconf = CompositeDelphiV2Config(**model_args)
+    model = CompositeDelphiV2(gptconf)
+    state_dict = checkpoint['model']
+    unwanted_prefix = '_orig_mod.'
+    for k, v in list(state_dict.items()):
+        if k.startswith(unwanted_prefix):
+            state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+    model.load_state_dict(state_dict)
+    iter_num = checkpoint['iter_num']
+    best_val_loss = checkpoint['best_val_loss']
 
 model.to(device)
 
@@ -416,29 +319,7 @@ if compile:
 # =============================================================================
 
 @torch.no_grad()
-def estimate_loss_modern():
-    """Estimate loss for Modern Delphi (3-column data)"""
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters, 2)
-        data = train_data if split == 'train' else val_data
-        p2i = train_p2i if split == 'train' else val_p2i
-        for k in range(eval_iters):
-            ix = torch.randint(len(p2i), (batch_size,))
-            X, A, Y, B = get_batch(ix, data, p2i, block_size=block_size,
-                                   device=device, select='left',
-                                   no_event_token_rate=no_event_token_rate,
-                                   cut_batch=True)
-            with ctx:
-                logits, loss, _ = model(X, A, Y, B, validation_loss_mode=True)
-            losses[k] = torch.stack([loss['loss_ce'], loss['loss_dt']])
-        out[split] = losses.mean(0)
-    model.train()
-    return out
-
-@torch.no_grad()
-def estimate_loss_composite():
+def estimate_loss():
     """Estimate loss for Composite Delphi (5-column data)"""
     out = {}
     model.eval()
@@ -472,13 +353,6 @@ def estimate_loss_composite():
     model.train()
     return out
 
-
-def estimate_loss():
-    if model_type == 'composite':
-        return estimate_loss_composite()
-    else:
-        return estimate_loss_modern()
-
 # =============================================================================
 # Learning Rate Scheduler
 # =============================================================================
@@ -509,7 +383,7 @@ if wandb_log:
 # =============================================================================
 
 print(f"\n{'='*60}")
-print(f"Starting training: {model_type.upper()} Delphi")
+print("Starting training: COMPOSITE Delphi")
 print(f"{'='*60}")
 print(f"  Device: {device}")
 print(f"  Batch size: {batch_size}")
@@ -519,18 +393,12 @@ print(f"  Learning rate: {learning_rate}")
 print(f"{'='*60}\n")
 
 # Initial batch (weighted sampling for SHIFT class balance)
-if model_type == 'composite':
-    ix = torch.multinomial(patient_weights_tensor, batch_size, replacement=True)
-    batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
-                                padding='random', lifestyle_augmentations=True, select='left',
-                                no_event_token_rate=no_event_token_rate,
-                                apply_token_shift=apply_token_shift)
-    x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
-else:
-    ix = torch.randint(len(train_p2i), (batch_size,))
-    X, A, Y, B = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
-                           padding='random', lifestyle_augmentations=True, select='left',
-                           no_event_token_rate=no_event_token_rate)
+ix = torch.multinomial(patient_weights_tensor, batch_size, replacement=True)
+batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
+                            padding='random', lifestyle_augmentations=True, select='left',
+                            no_event_token_rate=no_event_token_rate,
+                            apply_token_shift=apply_token_shift)
+x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
 
 t0 = time.time()
 local_iter_num = 0
@@ -546,52 +414,33 @@ while True:
     # Note: All processes must call estimate_loss() to avoid DDP deadlock
     if iter_num % eval_interval == 0 and iter_num > 0:
         losses = estimate_loss()
-        
-        if model_type == 'composite':
-            # Composite model has 5 loss components
-            if val_loss is None:
-                val_loss_unpooled = losses['val']
-            val_loss_unpooled = 0.1 * losses['val'] + 0.9 * val_loss_unpooled
-            val_loss = val_loss_unpooled[0].item()  # Total loss
-            
-            train_breakdown = losses['train']
-            val_breakdown = losses['val']
-            print(f"step {iter_num}: train loss {train_breakdown[0].item():.4f}, val loss {val_breakdown[0].item():.4f} (ema {val_loss:.4f})")
-            print(
-                "  breakdown (train/val) - "
-                f"data: {train_breakdown[1].item():.4f}/{val_breakdown[1].item():.4f}, "
-                f"shift: {train_breakdown[2].item():.4f}/{val_breakdown[2].item():.4f}, "
-                f"total: {train_breakdown[3].item():.4f}/{val_breakdown[3].item():.4f}, "
-                f"time: {train_breakdown[4].item():.4f}/{val_breakdown[4].item():.4f}"
-            )
-            
-            if wandb_log:
-                wandb.log({
-                    "iter": iter_num,
-                    "train/loss": losses['train'][0].item(),
-                    "val/loss": val_loss,
-                    "val/loss_data": val_loss_unpooled[1].item(),
-                    "val/loss_shift": val_loss_unpooled[2].item(),
-                    "val/loss_total": val_loss_unpooled[3].item(),
-                    "val/loss_time": val_loss_unpooled[4].item(),
-                })
-        else:
-            # Modern model has 2 loss components (ce, dt)
-            if val_loss is None:
-                val_loss_unpooled = losses['val']
-            val_loss_unpooled = 0.1 * losses['val'] + 0.9 * val_loss_unpooled
-            val_loss = val_loss_unpooled.sum().item()
-            
-            print(f"step {iter_num}: train loss {losses['train'].sum().item():.4f}, val loss {losses['val'].sum().item():.4f} ({val_loss:.4f})")
-            
-            if wandb_log:
-                wandb.log({
-                    "iter": iter_num,
-                    "train/agg_loss": losses['train'].sum().item(),
-                    "val/loss": val_loss,
-                    "val/loss_ce": val_loss_unpooled[0].item(),
-                    "val/loss_dt": val_loss_unpooled[1].item(),
-                })
+
+        if val_loss is None:
+            val_loss_unpooled = losses['val']
+        val_loss_unpooled = 0.1 * losses['val'] + 0.9 * val_loss_unpooled
+        val_loss = val_loss_unpooled[0].item()
+
+        train_breakdown = losses['train']
+        val_breakdown = losses['val']
+        print(f"step {iter_num}: train loss {train_breakdown[0].item():.4f}, val loss {val_breakdown[0].item():.4f} (ema {val_loss:.4f})")
+        print(
+            "  breakdown (train/val) - "
+            f"data: {train_breakdown[1].item():.4f}/{val_breakdown[1].item():.4f}, "
+            f"shift: {train_breakdown[2].item():.4f}/{val_breakdown[2].item():.4f}, "
+            f"total: {train_breakdown[3].item():.4f}/{val_breakdown[3].item():.4f}, "
+            f"time: {train_breakdown[4].item():.4f}/{val_breakdown[4].item():.4f}"
+        )
+
+        if wandb_log:
+            wandb.log({
+                "iter": iter_num,
+                "train/loss": losses['train'][0].item(),
+                "val/loss": val_loss,
+                "val/loss_data": val_loss_unpooled[1].item(),
+                "val/loss_shift": val_loss_unpooled[2].item(),
+                "val/loss_total": val_loss_unpooled[3].item(),
+                "val/loss_time": val_loss_unpooled[4].item(),
+            })
 
         # Save best checkpoint
         if always_save_checkpoint or val_loss < best_val_loss:
@@ -607,8 +456,7 @@ while True:
                     'model_type': model_type,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                ckpt_name = 'ckpt_composite_v2.pt' if model_type == 'composite' else 'ckpt.pt'
-                torch.save(checkpoint, os.path.join(out_dir, ckpt_name))
+                torch.save(checkpoint, os.path.join(out_dir, 'ckpt_composite_v2.pt'))
 
         # Save periodic checkpoint
         if iter_num % 10_000 == 0:
@@ -622,10 +470,7 @@ while True:
                 'model_type': model_type,
             }
             print(f"saving periodic checkpoint to {out_dir}")
-            if model_type == 'composite':
-                ckpt_name = f'ckpt_composite_v2_{iter_num}.pt'
-            else:
-                ckpt_name = f'ckpt_{iter_num}.pt'
+            ckpt_name = f'ckpt_composite_v2_{iter_num}.pt'
             torch.save(checkpoint, os.path.join(out_dir, ckpt_name))
 
     if iter_num == 0 and eval_only:
@@ -633,35 +478,19 @@ while True:
 
     # Training step
     for micro_step in range(gradient_accumulation_steps):
-        if model_type == 'composite':
-            with ctx:
-                logits, loss, att = model(
-                    x_data, x_shift, x_total, x_ages,
-                    y_data, y_shift, y_total, y_ages
-                )
-            
-            # Prefetch next batch (weighted sampling for SHIFT class balance)
-            ix = torch.multinomial(patient_weights_tensor, batch_size, replacement=True)
-            batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
-                                        padding='random', lifestyle_augmentations=True, select='left',
-                                        no_event_token_rate=no_event_token_rate, cut_batch=True,
-                                        apply_token_shift=apply_token_shift)
-            x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
-            
-            # Total loss
-            total_loss = loss['loss']
-        else:
-            with ctx:
-                logits, loss, att = model(X, A, Y, B)
-            
-            # Prefetch next batch
-            ix = torch.randint(len(train_p2i), (batch_size,))
-            X, A, Y, B = get_batch(ix, train_data, train_p2i, block_size=block_size, device=device,
-                                   padding='random', lifestyle_augmentations=True, select='left',
-                                   no_event_token_rate=no_event_token_rate, cut_batch=True)
-            
-            # Combined loss
-            total_loss = loss['loss_ce'] + loss['loss_dt']
+        with ctx:
+            logits, loss, att = model(
+                x_data, x_shift, x_total, x_ages,
+                y_data, y_shift, y_total, y_ages
+            )
+
+        ix = torch.multinomial(patient_weights_tensor, batch_size, replacement=True)
+        batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
+                                    padding='random', lifestyle_augmentations=True, select='left',
+                                    no_event_token_rate=no_event_token_rate, cut_batch=True,
+                                    apply_token_shift=apply_token_shift)
+        x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
+        total_loss = loss['loss']
 
         scaler.scale(total_loss).backward()
 
@@ -671,7 +500,7 @@ while True:
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
     # Gradient monitoring for debugging (every 1000 iters)
-    if iter_num % 1000 == 0 and model_type == 'composite':
+    if iter_num % 1000 == 0:
         grad_info = []
         for name, param in model.named_parameters():
             if param.grad is not None:
@@ -702,19 +531,15 @@ while True:
             print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {lr:.2e}")
 
         if wandb_log:
-            log_dict = {
+            wandb.log({
                 "iter": iter_num,
                 "train/loss": total_loss.item(),
+                "train/loss_data": loss['loss_data'].item(),
+                "train/loss_shift": loss['loss_shift'].item(),
+                "train/loss_total": loss['loss_total'].item(),
+                "train/loss_time": loss['loss_time'].item(),
                 "lr": lr,
-            }
-            if model_type == 'composite':
-                log_dict.update({
-                    "train/loss_data": loss['loss_data'].item(),
-                    "train/loss_shift": loss['loss_shift'].item(),
-                    "train/loss_total": loss['loss_total'].item(),
-                    "train/loss_time": loss['loss_time'].item(),
-                })
-            wandb.log(log_dict)
+            })
 
     iter_num += 1
     local_iter_num += 1

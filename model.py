@@ -352,8 +352,8 @@ class MixtureOfExperts(nn.Module):
         return final_output, aux_loss
 
 
-class ModernFFN(nn.Module):
-    """Modern FFN with SwiGLU activation"""
+class TransformerFFN(nn.Module):
+    """FFN with SwiGLU activation"""
     
     def __init__(self, config):
         super().__init__()
@@ -373,8 +373,8 @@ class ModernFFN(nn.Module):
         return x
 
 
-class ModernBlock(nn.Module):
-    """Transformer block with modern architecture"""
+class TransformerBlock(nn.Module):
+    """Transformer block"""
     
     def __init__(self, config, layer_idx: int):
         super().__init__()
@@ -386,7 +386,7 @@ class ModernBlock(nn.Module):
         if hasattr(config, 'use_moe') and config.use_moe:
             self.mlp = MixtureOfExperts(config)
         else:
-            self.mlp = ModernFFN(config)
+            self.mlp = TransformerFFN(config)
 
     def forward(self, x, age=None, attn_mask=None):
         # Pre-norm architecture (more stable)
@@ -398,322 +398,6 @@ class ModernBlock(nn.Module):
             mlp_out, aux_loss = mlp_out
         x = x + mlp_out
         return x, att, aux_loss
-
-@dataclass
-class ModernDelphiConfig:
-    """Configuration for Modern Delphi"""
-    block_size: int = 1024
-    vocab_size: int = 1290  # Death token: raw 1288 → shifted 1289
-    n_layer: int = 12
-    n_head: int = 12
-    n_kv_head: int = 4  # Grouped Query Attention (3x fewer KV heads)
-    n_embd: int = 384
-    dropout: float = 0.1
-    token_dropout: float = 0.0
-    bias: bool = False  # False is more modern
-    
-    # Medical specific
-    t_min: float = 0.1
-    mask_ties: bool = True
-    ignore_tokens: list = field(default_factory=lambda: [0])
-    
-    # Modern architecture features
-    use_moe: bool = False  # Enable Mixture of Experts
-    num_experts: int = 8
-    experts_per_token: int = 2
-    sliding_window: int = 256  # Sliding window attention
-    rope_theta: float = 10000.0
-    
-    # Time-to-Event distribution: 'exponential' or 'weibull'
-    time_distribution: str = 'exponential'
-
-class ModernDelphi(nn.Module):
-    """Modern Delphi with GPT-OSS inspired architecture"""
-    
-    def __init__(self, config):
-        super().__init__()
-        assert config.vocab_size is not None
-        assert config.block_size is not None
-        self.config = config
-
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wae = AgeEncoding(config),
-            token_drop = nn.Dropout(config.token_dropout),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([ModernBlock(config, i) for i in range(config.n_layer)]),
-            ln_f = RMSNorm(config.n_embd),
-        ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
-        # Weibull shape head (for time-to-event)
-        time_distribution = getattr(config, 'time_distribution', 'exponential')
-        if time_distribution == 'weibull':
-            self.time_shape_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        
-        # Weight tying
-        self.transformer.wte.weight = self.lm_head.weight
-
-        # Initialize weights
-        self.apply(self._init_weights)
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight') or pn.endswith('o_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-
-    def get_num_params(self, non_embedding=True):
-        n_params = sum(p.numel() for p in self.parameters())
-        return n_params
-
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
-    def forward(self, idx, age, targets=None, targets_age=None, validation_loss_mode=False):
-        device = idx.device
-        b, t = idx.size()
-        
-        # Token + Age embeddings
-        tok_emb = self.transformer.wte(idx)
-        age_emb = self.transformer.wae(age)
-        
-        x = self.transformer.token_drop(tok_emb) * (1 - self.config.token_dropout)
-        x = x + age_emb
-        x = self.transformer.drop(x)
-        
-        # Attention mask (medical specific)
-        attn_mask = (idx > 0).view(b, 1, 1, t) * (idx > 0).view(b, 1, t, 1)
-        attn_mask *= torch.tril(torch.ones(t, t, device=device))[None, None, :, :] > 0
-        
-        if targets is not None and self.config.mask_ties:
-            attn_mask *= ((age.view(b, 1, 1, t) != targets_age.view(b, 1, t, 1)))
-            attn_mask += (attn_mask.sum(-1, keepdim=True) == 0) * torch.diag(torch.ones(t, device=device)) > 0
-        
-        attn_mask = attn_mask + (idx == 0).view(b, 1, 1, t) * torch.diag(torch.ones(t, device=device)) > 0
-        attn_mask *= torch.tril(torch.ones(t, t, device=device))[None, None, :, :] > 0
-        
-        # Transformer blocks
-        att = []
-        for block in self.transformer.h:
-            x, a, _aux = block(x, age, attn_mask)
-            att.append(a)
-        
-        x = self.transformer.ln_f(x)
-        att = torch.stack(att) if att[0] is not None else None
-
-        if targets is not None:
-            # Medical loss computation (same as original Delphi)
-            logits = self.lm_head(x)
-
-            ignored_tokens = self.config.ignore_tokens.copy()
-            if validation_loss_mode:
-                ignored_tokens += [1]
-                logits[..., ignored_tokens] = -torch.inf
-            
-            targets_flat = targets.reshape(-1)
-            pass_tokens = targets_flat != -1
-            for k in ignored_tokens:
-                pass_tokens *= targets_flat != k
-            
-            loss_ce = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1))[pass_tokens], 
-                targets_flat[pass_tokens], 
-                ignore_index=-1
-            )
-            
-            # Time-to-event loss
-            dt = torch.clamp(targets_age - age, min=1.0)
-            
-            if self.config.mask_ties:
-                dt = torch.gather(
-                    dt, -1, 
-                    (attn_mask * torch.arange(0, t, device=device, dtype=torch.float32).view(1, 1, 1, -1))
-                    .max(-1).indices.squeeze((1, 2))
-                )
-            
-            time_distribution = getattr(self.config, 'time_distribution', 'exponential')
-            
-            if time_distribution == 'weibull':
-                # Weibull Distribution Loss (수치 안정성 강화)
-                # Shape parameter (k > 0)
-                time_shape = F.softplus(self.time_shape_head(x)) + 0.1  # (B, T, vocab_size)
-                
-                # λ = exp(logsumexp) ensures positivity
-                log_scale = torch.logsumexp(logits, -1)  # (B, T)
-                scale = torch.clamp(torch.exp(log_scale), min=0.1, max=1e4) + self.config.t_min
-                
-                # k = weighted mean shape (clamp for stability)
-                event_probs = F.softmax(logits, dim=-1)  # (B, T, vocab_size)
-                shape = torch.clamp((event_probs * time_shape).sum(-1), min=0.1, max=10.0)  # (B, T)
-                
-                # Weibull negative log-likelihood with numerical stability
-                dt_flat = torch.clamp(dt.view(-1), min=0.1) + self.config.t_min
-                scale_flat = scale.view(-1)
-                shape_flat = shape.view(-1)
-                
-                # Clamp ratio to prevent overflow
-                ratio = torch.clamp(dt_flat / scale_flat, min=1e-6, max=1e3)
-                
-                log_likelihood = (
-                    torch.log(shape_flat + 1e-8) - 
-                    shape_flat * torch.log(scale_flat + 1e-8) + 
-                    (shape_flat - 1) * torch.log(dt_flat + 1e-8) - 
-                    ratio.pow(shape_flat)
-                )
-                # Clamp final loss to prevent NaN
-                loss_dt = -torch.mean(torch.clamp(log_likelihood[pass_tokens], min=-100, max=100))
-            else:
-                # Exponential Distribution Loss (기존)
-                lse = torch.logsumexp(logits, -1)
-                lse = -torch.log(torch.exp(-lse) + self.config.t_min)
-                
-                ldt = -torch.log(dt + self.config.t_min).view(-1)
-                loss_dt = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - ldt.reshape(-1)))
-                loss_dt = torch.mean(loss_dt[pass_tokens])
-            
-            loss = {'loss_ce': loss_ce, 'loss_dt': loss_dt}
-        else:
-            logits = self.lm_head(x)
-            loss = None
-
-        return logits, loss, att
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        """Configure optimizer (same as original Delphi)"""
-        decay = set()
-        no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear,)
-        blacklist_weight_modules = (RMSNorm, torch.nn.Embedding, torch.nn.LayerNorm)
-        
-        for mn, m in self.named_modules():
-            for pn, p in m.named_parameters():
-                fpn = '%s.%s' % (mn, pn) if mn else pn
-                if pn.endswith('bias'):
-                    no_decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
-                    decay.add(fpn)
-                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
-                    no_decay.add(fpn)
-                elif isinstance(m, RMSNorm) and pn == 'scale':
-                    # RMSNorm scale parameter
-                    no_decay.add(fpn)
-                elif pn.endswith('weight'):
-                    # Any other weight parameter defaults to decay
-                    decay.add(fpn)
-
-        # Handle weight tying: lm_head.weight is tied to wte.weight (Embedding)
-        # So it should be in no_decay, not decay
-        if 'lm_head.weight' in decay:
-            decay.discard('lm_head.weight')
-        if 'lm_head.weight' not in no_decay:
-            no_decay.add('lm_head.weight')
-
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        
-        # Remove lm_head.weight from no_decay if it doesn't exist in param_dict (due to weight tying)
-        # The actual parameter is wte.weight, which is already handled as an Embedding
-        if 'lm_head.weight' in no_decay and 'lm_head.weight' not in param_dict:
-            no_decay.discard('lm_head.weight')
-        
-        # Check for overlapping parameters and resolve
-        inter_params = decay & no_decay
-        if inter_params:
-            if _is_master():
-                print(f"Warning: Found {len(inter_params)} parameters in both decay and no_decay, moving to no_decay:")
-                for pn in sorted(inter_params):
-                    print(f"  {pn}")
-            for pn in list(inter_params):
-                decay.discard(pn)
-        
-        union_params = decay | no_decay
-        
-        # Find missing parameters
-        missing_params = param_dict.keys() - union_params
-        if missing_params:
-            if _is_master():
-                print(f"Warning: Found {len(missing_params)} unclassified parameters, adding to no_decay:")
-                for pn in sorted(missing_params):
-                    print(f"  {pn}")
-            for pn in missing_params:
-                no_decay.add(pn)
-        
-        # Final check
-        union_params = decay | no_decay
-        inter_params = decay & no_decay
-        assert len(inter_params) == 0, f"Still have overlapping params: {inter_params}"
-        assert len(param_dict.keys() - union_params) == 0, f"Missing params: {param_dict.keys() - union_params}"
-
-        optim_groups = [
-            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
-            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
-        ]
-        
-        use_fused = (device_type == 'cuda') and ('fused' in inspect.signature(torch.optim.AdamW).parameters)
-        if _is_master():
-            print(f"using fused AdamW: {use_fused}")
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-
-        return optimizer
-
-    @torch.no_grad()
-    def generate(self, idx, age, max_new_tokens=100, max_age=85*365.25, no_repeat=True, 
-                 termination_tokens=None, top_k=None):
-        """Generate medical trajectories (same as original Delphi)"""
-        if termination_tokens is None:
-            warnings.warn('When using a custom dataset, consider changing the `termination_tokens` argument.')
-            termination_tokens = [1269]
-        
-        termination_tokens = torch.tensor(termination_tokens, dtype=torch.int64, device=idx.device)
-        
-        if max_new_tokens == -1:
-            max_new_tokens = 128
-
-        for _ in range(max_new_tokens):
-            logits, _, _ = self(idx, age)
-            logits = logits[:, -1, :]
-            logits[:, self.config.ignore_tokens] = -torch.inf
-
-            if no_repeat:
-                fill = idx.clone()
-                fill[fill == 1] = 0
-                logits = logits.scatter_(1, fill, -torch.inf)
-            
-            # Exponential sampling for time-to-event
-            t_next = torch.clamp(
-                -torch.exp(-logits) * torch.rand(logits.shape, device=idx.device).log(), 
-                min=0, max=365*80
-            ).min(1)
-            idx_next = t_next[1][:, None]
-            age_next = age[..., [-1]] + t_next[0][:, None]
-            
-            idx = torch.cat((idx, idx_next), dim=1)
-            age = torch.cat((age, age_next), dim=1)
-            
-            if torch.logical_or(torch.isin(idx, termination_tokens).any(-1), age_next > max_age).all():
-                break
-        
-        pad = (torch.cumsum(torch.cumsum(torch.isin(idx, termination_tokens), 1).bool().int(), 1) > 1) + (age > max_age)
-        
-        logits, _, _ = self(idx, age)
-        idx[pad] = 0
-        age[pad] = -10000
-
-        if no_repeat:
-            fill = idx + 0
-            fill[fill == 1] = 0
-            logits = torch.stack([
-                logits[:, j].scatter_(1, fill[:, :j+1], -torch.inf) 
-                for j in range(fill.shape[1])
-            ]).transpose(0, 1)
-
-        return idx, age, logits
-
 
 # =============================================================================
 # Composite Embedding + Multi-Head Output Architecture
@@ -977,7 +661,7 @@ class CompositeDelphiConfig:
     drug_token_min: int = 1279  # First drug token after +1 shift (Metformin)
     drug_token_max: int = 1289  # Last drug token after +1 shift (Death)
 
-    # Modern architecture features
+    # Architecture features
     use_moe: bool = True
     num_experts: int = 8
     experts_per_token: int = 2
@@ -1031,7 +715,7 @@ class CompositeDelphi(nn.Module):
         self.drop = nn.Dropout(config.dropout)
         
         # Transformer blocks (기존과 동일)
-        self.h = nn.ModuleList([ModernBlock(config, i) for i in range(config.n_layer)])
+        self.h = nn.ModuleList([TransformerBlock(config, i) for i in range(config.n_layer)])
         
         # Final normalization
         self.ln_f = RMSNorm(config.n_embd)

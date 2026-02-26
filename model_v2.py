@@ -9,8 +9,6 @@ from dataclasses import dataclass, field
 import torch
 
 from model import (
-    ModernDelphi,
-    ModernDelphiConfig,
     CompositeDelphi,
     CompositeDelphiConfig,
 )
@@ -173,8 +171,6 @@ class CompositeDelphiV2(CompositeDelphi):
 
 
 __all__ = [
-    'ModernDelphi',
-    'ModernDelphiConfig',
     'CompositeDelphiV2',
     'CompositeDelphiV2Config',
 ]
