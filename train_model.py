@@ -339,6 +339,8 @@ model_args = dict(
     sliding_window=sliding_window,
     rope_theta=rope_theta,
     use_drug_conditioning=use_drug_conditioning,
+    drug_token_min=drug_token_min,
+    drug_token_max=drug_token_max,
     total_log_transform=total_log_transform,
     # Composite-specific
     data_vocab_size=data_vocab_size,

@@ -525,16 +525,8 @@ class MultiHeadOutput(nn.Module):
                 nn.GELU(),
                 nn.Linear(config.n_embd // 2, 1)
             )
-            
-            # Initialize FiLM generators for identity transformation (gamma=1, beta=0)
-            # This ensures stable training start
-            for film_gen in [self.shift_film_generator, self.total_film_generator]:
-                last_layer = film_gen[-1]  # Last Linear layer
-                nn.init.zeros_(last_layer.weight)
-                # Initialize bias: first half (gamma) = 1, second half (beta) = 0
-                with torch.no_grad():
-                    last_layer.bias[:config.n_embd].fill_(1.0)  # gamma = 1
-                    last_layer.bias[config.n_embd:].zero_()      # beta = 0
+            # Provisional identity init here; reapplied after parent model init.
+            self.reset_film_identity()
         
         # Time Head: scale parameter (λ) for all event types
         self.time_head = nn.Linear(config.n_embd, config.data_vocab_size, bias=False)
@@ -543,6 +535,18 @@ class MultiHeadOutput(nn.Module):
         if self.time_distribution == 'weibull':
             # Shape parameter per event type (more expressive)
             self.time_shape_head = nn.Linear(config.n_embd, config.data_vocab_size, bias=False)
+
+    def reset_film_identity(self):
+        """Initialize FiLM generators to identity: gamma=1, beta=0."""
+        if not self.use_drug_conditioning:
+            return
+        for film_gen in [self.shift_film_generator, self.total_film_generator]:
+            last_layer = film_gen[-1]  # Last Linear layer
+            nn.init.zeros_(last_layer.weight)
+            with torch.no_grad():
+                # first half = gamma, second half = beta
+                last_layer.bias[:self.n_embd].fill_(1.0)
+                last_layer.bias[self.n_embd:].zero_()
         
     def forward(self, x, drug_emb=None, drug_token_mask=None):
         """
@@ -653,13 +657,11 @@ class CompositeDelphiConfig:
     # FiLM (Feature-wise Linear Modulation) 방식 사용
     use_drug_conditioning: bool = False
     
-    # Drug token range (after +1 shift in get_batch_composite):
-    # Raw tokens: Metformin(1278), Sulfonylurea(1279), DPP-4(1280), Insulin(1281), 
-    #             Meglitinide(1282), Thiazolidinedione(1283), Alpha-glucosidase(1284),
-    #             GLP-1(1285), SGLT-2(1286), Other(1287), Death(1288)
-    # Shifted tokens: 1279-1289 (inclusive)
-    drug_token_min: int = 1279  # First drug token after +1 shift (Metformin)
-    drug_token_max: int = 1289  # Last drug token after +1 shift (Death)
+    # Drug token range defaults for apply_token_shift=False (raw tokens):
+    # Metformin(1278) ... Death(1288)
+    # If apply_token_shift=True, override via model_args to 1279..1289.
+    drug_token_min: int = 1278
+    drug_token_max: int = 1288
 
     # Architecture features
     use_moe: bool = True
@@ -731,6 +733,8 @@ class CompositeDelphi(nn.Module):
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight') or pn.endswith('o_proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+        # Re-apply FiLM identity init after global init to avoid overwrite.
+        self.multi_head.reset_film_identity()
     
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
@@ -819,9 +823,9 @@ class CompositeDelphi(nn.Module):
                 drug_emb = self.composite_emb.data_emb(drug_source_clamped)
             
             # Create drug token mask: FiLM only applies when TARGET is a drug
-            # Drug tokens range (after +1 shift): 1279-1289
-            drug_token_min = getattr(self.config, 'drug_token_min', 1279)
-            drug_token_max = getattr(self.config, 'drug_token_max', 1289)
+            # Drug token range must match data tokenization setup.
+            drug_token_min = getattr(self.config, 'drug_token_min', 1278)
+            drug_token_max = getattr(self.config, 'drug_token_max', 1288)
             if targets_data is not None:
                 drug_token_mask = (targets_data >= drug_token_min) & (targets_data <= drug_token_max)
         
@@ -1170,15 +1174,15 @@ class CompositeDelphi(nn.Module):
             
             # Get last position logits
             data_logits = logits['data'][:, -1, :]
-            shift_logits_source = logits['shift']
+            shift_logits_base = logits['shift'][:, -1, :]
+            shift_logits_drug = shift_logits_base
             if 'shift_drug_cond' in logits and self.config.use_drug_conditioning:
-                shift_logits_source = logits['shift_drug_cond']
-            shift_logits = shift_logits_source[:, -1, :]
+                shift_logits_drug = logits['shift_drug_cond'][:, -1, :]
 
-            total_pred_source = logits['total']
+            total_pred_base = logits['total'][:, -1]
+            total_pred_drug = total_pred_base
             if 'total_drug_cond' in logits and self.config.use_drug_conditioning:
-                total_pred_source = logits['total_drug_cond']
-            total_pred = total_pred_source[:, -1]
+                total_pred_drug = logits['total_drug_cond'][:, -1]
             time_logits = logits['time'][:, -1, :]
             
             # Mask ignored tokens
@@ -1198,6 +1202,16 @@ class CompositeDelphi(nn.Module):
             
             data_next = t_next[1][:, None]
             age_next = age[..., [-1]] + t_next[0][:, None]
+
+            # Use drug-conditioned SHIFT/TOTAL only when next DATA token is a drug.
+            shift_logits = shift_logits_base
+            total_pred = total_pred_base
+            if self.config.use_drug_conditioning:
+                drug_token_min = getattr(self.config, 'drug_token_min', 1278)
+                drug_token_max = getattr(self.config, 'drug_token_max', 1288)
+                next_is_drug = (data_next >= drug_token_min) & (data_next <= drug_token_max)  # (B, 1)
+                shift_logits = torch.where(next_is_drug, shift_logits_drug, shift_logits_base)
+                total_pred = torch.where(next_is_drug.squeeze(-1), total_pred_drug, total_pred_base)
             
             # Sample shift, total from their distributions
             shift_next = torch.argmax(shift_logits, dim=-1, keepdim=True)

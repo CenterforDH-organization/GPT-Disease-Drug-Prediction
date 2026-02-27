@@ -406,12 +406,15 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
     all_targets_pos = {'total': []}
 
     # Drug-conditioned predictions (if model uses drug-conditioning)
-    # Only evaluated for drug tokens (1279-1289)
+    # Only evaluated for drug tokens within configured range.
     all_predictions_shift_drug_cond = []
     all_predictions_total_drug_cond = []
     all_targets_shift_drug_cond = []  # Targets for drug-conditioned SHIFT
     all_targets_total_drug_cond = []  # Targets for drug-conditioned TOTAL
     use_drug_conditioning = getattr(model.config, 'use_drug_conditioning', False)
+    drug_token_min = int(getattr(model.config, 'drug_token_min', 1278))
+    drug_token_max = int(getattr(model.config, 'drug_token_max', 1288))
+    drug_token_note = f"Metrics computed only for drug tokens ({drug_token_min}-{drug_token_max})"
     
     x_data, x_shift, x_total, x_ages = d100k[0], d100k[1], d100k[2], d100k[3]
     y_data, y_shift, y_total, y_ages = d100k[4], d100k[5], d100k[6], d100k[7]
@@ -461,10 +464,7 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
             shift_mask = (batch_y_shift != -1) & (batch_y_shift > 0)  # 0 is padding/unknown
             total_mask = (batch_y_total != -1) & (batch_y_total >= 0)
             
-            # Drug token mask: only evaluate drug-conditioned predictions for drug tokens
-            # Drug tokens: 1279-1289 (after +1 shift: Metformin~Death)
-            drug_token_min = getattr(model.config, 'drug_token_min', 1279)
-            drug_token_max = getattr(model.config, 'drug_token_max', 1289)
+            # Drug token mask: only evaluate drug-conditioned predictions for configured drug range
             drug_token_mask = (batch_y_data >= drug_token_min) & (batch_y_data <= drug_token_max)
 
             # SHIFT (classification): store predictions/targets for valid shift tokens
@@ -640,7 +640,7 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
             results['shift_per_class_metrics_drug_cond'] = per_class_metrics_drug
             
             # Add note that these are drug-token-only metrics
-            results['shift_drug_cond_note'] = 'Metrics computed only for drug tokens (1279-1289)'
+            results['shift_drug_cond_note'] = drug_token_note
     
     # ============================================================
     # TOTAL: REGRESSION METRICS
@@ -701,7 +701,7 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
         results['total_mean_target_drug_cond'] = float(np.mean(tgt_drug))
         results['total_mean_pred_drug_cond'] = float(np.mean(pred_drug))
         results['total_support_drug_cond'] = int(len(tgt_drug))
-        results['total_drug_cond_note'] = 'Metrics computed only for drug tokens (1279-1289)'
+        results['total_drug_cond_note'] = drug_token_note
     
     return results
 
@@ -1017,9 +1017,10 @@ def evaluate_auc_pipeline(
                         print(f"    Class {cls}: Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, "
                               f"F1={metrics['f1']:.4f}, Support={metrics['support']}")
             
-            # Drug-conditioned SHIFT metrics (ONLY for drug tokens: 1279-1289)
+            # Drug-conditioned SHIFT metrics (ONLY for configured drug token range)
             if 'shift_accuracy_drug_cond' in composite_metrics:
-                print(f"\n  Drug-Conditioned (Drug Tokens Only, 1279-1289):")
+                shift_drug_note = composite_metrics.get('shift_drug_cond_note', 'Metrics computed only for configured drug token range')
+                print(f"\n  Drug-Conditioned ({shift_drug_note}):")
                 print(f"    Accuracy: {composite_metrics['shift_accuracy_drug_cond']:.4f}")
                 if 'shift_balanced_accuracy_drug_cond' in composite_metrics:
                     print(f"    Balanced Accuracy: {composite_metrics['shift_balanced_accuracy_drug_cond']:.4f}")
@@ -1070,9 +1071,10 @@ def evaluate_auc_pipeline(
                 print(f"  R²: {composite_metrics[f'{field}_r2']:.4f}")
             if f'{field}_mae_pos' in composite_metrics:
                 print(f"  MAE (target>0): {composite_metrics[f'{field}_mae_pos']:.4f} (n={composite_metrics.get(f'{field}_support_pos', 'NA')})")
-            # TOTAL drug-conditioned extras (ONLY for drug tokens: 1279-1289)
+            # TOTAL drug-conditioned extras (ONLY for configured drug token range)
             if 'total_mae_drug_cond' in composite_metrics:
-                print(f"\n  Drug-Conditioned (Drug Tokens Only, 1279-1289):")
+                total_drug_note = composite_metrics.get('total_drug_cond_note', 'Metrics computed only for configured drug token range')
+                print(f"\n  Drug-Conditioned ({total_drug_note}):")
                 print(f"    MAE: {composite_metrics['total_mae_drug_cond']:.4f}")
                 if 'total_rmse_drug_cond' in composite_metrics:
                     print(f"    RMSE: {composite_metrics['total_rmse_drug_cond']:.4f}")
@@ -1164,7 +1166,16 @@ def main():
     # Load model checkpoint and initialize model.
     ckpt_path = args.model_ckpt_path
     checkpoint = torch.load(ckpt_path, map_location=device)
-    model_args = checkpoint["model_args"]
+    model_args = dict(checkpoint["model_args"])
+    eval_apply_token_shift = False  # must match get_batch_composite below
+    if 'drug_token_min' not in model_args or 'drug_token_max' not in model_args:
+        model_args['drug_token_min'] = 1279 if eval_apply_token_shift else 1278
+        model_args['drug_token_max'] = 1289 if eval_apply_token_shift else 1288
+        print(
+            f"Checkpoint missing drug token range; using fallback "
+            f"[{model_args['drug_token_min']}, {model_args['drug_token_max']}] "
+            f"(apply_token_shift={eval_apply_token_shift})."
+        )
     
     # Extract MoE and other architecture info for metadata
     use_moe = model_args.get('use_moe', False)
@@ -1351,7 +1362,7 @@ def main():
             device=device,
             padding="random",
             no_event_token_rate=no_event_token_rate,
-            apply_token_shift=False,  # Ensure no +1 shift, matching training config
+            apply_token_shift=eval_apply_token_shift,
         )
         
         # Prepare meta info with data source
