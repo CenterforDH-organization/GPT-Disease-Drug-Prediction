@@ -990,51 +990,40 @@ class CompositeDelphi(nn.Module):
         
         if time_distribution == 'weibull':
             # ============================================================
-            # Weibull Distribution Loss (수치 안정성 강화 v2)
+            # Weibull Distribution Loss (rate parameterization)
             # ============================================================
-            # PDF: f(t) = (k/λ) * (t/λ)^(k-1) * exp(-(t/λ)^k)
-            # log f(t) = log(k) - k*log(λ) + (k-1)*log(t) - (t/λ)^k
-            
-            # Use time head logits for scale parameter (consistent with exponential)
+            # f(t) = k * lambda * t^(k-1) * exp(-lambda * t^k)
+            # log f(t) = log(k) + log(lambda) + (k-1)*log(t) - lambda*t^k
+            # k=1이면 Exponential(rate=lambda)로 환원된다.
             time_logits = logits['time_scale']  # (B, T, data_vocab_size)
-            time_shape = logits['time_shape']  # (B, T, vocab_size) - k (positive)
-            
-            # λ = exp(logsumexp) ensures positivity
-            log_scale = torch.logsumexp(time_logits, -1)  # (B, T)
-            scale = torch.clamp(torch.exp(log_scale), min=1.0, max=365.0)  # 1일~1년 범위로 제한
-            
-            # k = weighted mean shape (clamp for stability)
-            event_probs = F.softmax(time_logits, dim=-1)  # (B, T, vocab_size)
-            shape = torch.clamp((event_probs * time_shape).sum(-1), min=0.5, max=5.0)  # 더 좁은 범위
-            
-            # Weibull negative log-likelihood with numerical stability
-            dt_flat = torch.clamp(dt.view(-1), min=1.0)  # 최소 1일
-            scale_flat = scale.view(-1)
-            shape_flat = shape.view(-1)
-            
-            # Compute log-likelihood components separately for numerical stability
-            log_shape = torch.log(shape_flat)
-            log_scale = torch.log(scale_flat)
+            time_shape = logits['time_shape']  # (B, T, data_vocab_size), already positive
+
+            # Competing-risk aggregate rate: lambda_total = sum_i exp(logit_i)
+            log_lambda = torch.logsumexp(time_logits, dim=-1)  # (B, T)
+            log_lambda = torch.clamp(log_lambda, min=-20.0, max=20.0)
+
+            # Shared shape k from event-probability-weighted mean
+            event_probs = F.softmax(time_logits, dim=-1)
+            shape = torch.clamp((event_probs * time_shape).sum(-1), min=0.2, max=5.0)  # (B, T)
+
+            dt_flat = torch.clamp(dt.reshape(-1), min=1.0)
+            log_lambda_flat = log_lambda.reshape(-1)
+            shape_flat = shape.reshape(-1)
             log_dt = torch.log(dt_flat)
-            
-            # (dt/scale)^k = exp(k * log(dt/scale))
-            log_ratio = log_dt - log_scale  # log(dt/scale)
-            power_term = torch.exp(shape_flat * log_ratio)  # (dt/scale)^k
-            
-            # Clamp power term to prevent explosion
-            power_term = torch.clamp(power_term, max=50.0)
-            
+
+            # lambda * t^k = exp(log_lambda + k*log(t))
+            hazard_exp = torch.clamp(log_lambda_flat + shape_flat * log_dt, max=50.0)
+            lambda_tk = torch.exp(hazard_exp)
+
             log_likelihood = (
-                log_shape - 
-                shape_flat * log_scale + 
-                (shape_flat - 1) * log_dt - 
-                power_term
+                torch.log(shape_flat) +
+                log_lambda_flat +
+                (shape_flat - 1.0) * log_dt -
+                lambda_tk
             )
-            
-            # Negative log-likelihood (loss)
-            # Clamp to reasonable range and only use valid tokens
+
             nll = -log_likelihood[pass_tokens]
-            loss_time = torch.clamp(nll, min=0.0, max=20.0).mean()
+            loss_time = torch.clamp(nll, min=0.0, max=50.0).mean()
             
         else:
             # ============================================================
@@ -1193,12 +1182,28 @@ class CompositeDelphi(nn.Module):
                 fill[fill == 1] = 0
                 data_logits = data_logits.scatter_(1, fill, -torch.inf)
             
-            # Sample next tokens
-            # Data: exponential sampling for time-to-event
-            t_next = torch.clamp(
-                -torch.exp(-time_logits) * torch.rand(time_logits.shape, device=data.device).log(),
-                min=0, max=365*80
-            ).min(1)
+            # Sample next tokens from configured time distribution
+            time_distribution = getattr(self.config, 'time_distribution', 'exponential')
+            if time_distribution == 'weibull' and 'time_shape' in logits:
+                # Weibull competing risks:
+                # T_i = (-log U / lambda_i)^(1/k), lambda_i = exp(time_logit_i)
+                # Use shared k (weighted average) to stay aligned with training loss.
+                time_shape_logits = logits['time_shape'][:, -1, :]  # (B, V), already positive
+                event_probs = F.softmax(time_logits, dim=-1)
+                shape = torch.clamp((event_probs * time_shape_logits).sum(-1, keepdim=True), min=0.2, max=5.0)  # (B, 1)
+
+                log_lambda_i = torch.clamp(time_logits, min=-20.0, max=20.0)
+                lambda_i = torch.exp(log_lambda_i)  # (B, V)
+                u = torch.rand_like(time_logits).clamp_min(1e-12)
+                w = -torch.log(u) / torch.clamp(lambda_i, min=1e-8)
+                sampled_t = torch.pow(torch.clamp(w, min=1e-12), 1.0 / shape)
+                t_next = torch.clamp(sampled_t, min=0.0, max=365 * 80).min(1)
+            else:
+                # Exponential competing risks (original Delphi behavior)
+                t_next = torch.clamp(
+                    -torch.exp(-time_logits) * torch.rand(time_logits.shape, device=data.device).log(),
+                    min=0, max=365*80
+                ).min(1)
             
             data_next = t_next[1][:, None]
             age_next = age[..., [-1]] + t_next[0][:, None]
